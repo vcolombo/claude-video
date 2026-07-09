@@ -90,9 +90,12 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
             return None
         return None
 
+    # Only the user's home config is consulted — deliberately NOT a project-local
+    # `.env` in the current working directory. A checked-in or planted `.env`
+    # must never silently supply a key, since that would quietly upload audio to
+    # a paid third-party API without the user opting in.
     dotenv_paths = [
         Path.home() / ".config" / "watch" / ".env",
-        Path.cwd() / ".env",
     ]
 
     candidates = (("GROQ_API_KEY", "groq"), ("OPENAI_API_KEY", "openai"))

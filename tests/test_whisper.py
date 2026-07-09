@@ -155,3 +155,57 @@ class TestTranscribeChunks:
 
         with pytest.raises(SystemExit):
             whisper.transcribe_chunks(chunks, always_fail)
+
+class TestLoadApiKey:
+    """Keys come only from the environment and ~/.config/watch/.env.
+
+    A project-local .env in the working directory must not silently enable paid
+    audio uploads to Groq/OpenAI Whisper.
+    """
+
+    @staticmethod
+    def _isolate(monkeypatch, home: Path) -> None:
+        for name in ("GROQ_API_KEY", "OPENAI_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        (home / ".config" / "watch").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(whisper.Path, "home", staticmethod(lambda: home))
+
+    def test_ignores_cwd_dotenv(self, tmp_path: Path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        self._isolate(monkeypatch, home)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("GROQ_API_KEY=groq-cwd-key\n", encoding="utf-8")
+
+        assert whisper.load_api_key() == (None, None)
+
+    def test_reads_home_config(self, tmp_path: Path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        self._isolate(monkeypatch, home)
+        (home / ".config" / "watch" / ".env").write_text(
+            "GROQ_API_KEY=groq-home-key\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("OPENAI_API_KEY=openai-cwd-key\n", encoding="utf-8")
+
+        assert whisper.load_api_key() == ("groq", "groq-home-key")
+
+    def test_env_var_still_works(self, tmp_path: Path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        self._isolate(monkeypatch, home)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-env-key")
+
+        assert whisper.load_api_key() == ("openai", "openai-env-key")
+
+    def test_env_var_takes_precedence_over_home_config(self, tmp_path: Path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        self._isolate(monkeypatch, home)
+        (home / ".config" / "watch" / ".env").write_text(
+            "GROQ_API_KEY=groq-home-key\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GROQ_API_KEY", "groq-env-key")
+
+        assert whisper.load_api_key() == ("groq", "groq-env-key")
