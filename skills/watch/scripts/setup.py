@@ -29,7 +29,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from config import get_config  # noqa: E402
+from config import get_config, parse_env_file  # noqa: E402
 
 
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
@@ -89,6 +89,22 @@ def _check_file_permissions(path: Path) -> None:
         pass
 
 
+def _secure_chmod(path: Path) -> None:
+    """chmod a secrets file to 0600, warning (not failing) if the FS refuses.
+
+    Some filesystems (mounted DOS/network shares) don't support chmod; we can't
+    hard-fail setup over it, but a silent pass would leave the key at the process
+    umask, so surface a one-line warning the user can act on."""
+    try:
+        path.chmod(0o600)
+    except OSError as exc:
+        sys.stderr.write(
+            f"[watch] WARNING: could not set 0600 permissions on {path} ({exc}). "
+            f"The file may be readable by other users — run: chmod 600 {path}\n"
+        )
+        sys.stderr.flush()
+
+
 def _read_env_key(name: str) -> str | None:
     value = os.environ.get(name)
     if value and value.strip():
@@ -96,21 +112,7 @@ def _read_env_key(name: str) -> str | None:
     if not CONFIG_FILE.exists():
         return None
     _check_file_permissions(CONFIG_FILE)
-    try:
-        for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, raw = line.partition("=")
-            if key.strip() != name:
-                continue
-            raw = raw.strip()
-            if len(raw) >= 2 and raw[0] in ('"', "'") and raw[-1] == raw[0]:
-                raw = raw[1:-1]
-            return raw or None
-    except OSError:
-        return None
-    return None
+    return parse_env_file(CONFIG_FILE).get(name) or None
 
 
 def _have_api_key() -> tuple[bool, str | None]:
@@ -132,10 +134,7 @@ def _scaffold_env() -> bool:
         return False
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(ENV_TEMPLATE, encoding="utf-8")
-    try:
-        CONFIG_FILE.chmod(0o600)
-    except OSError:
-        pass
+    _secure_chmod(CONFIG_FILE)
     return True
 
 
@@ -157,10 +156,7 @@ def _write_setup_complete() -> None:
         CONFIG_FILE.write_text(existing + "SETUP_COMPLETE=true\n", encoding="utf-8")
     else:
         CONFIG_FILE.write_text(ENV_TEMPLATE + "\nSETUP_COMPLETE=true\n", encoding="utf-8")
-    try:
-        CONFIG_FILE.chmod(0o600)
-    except OSError:
-        pass
+    _secure_chmod(CONFIG_FILE)
 
 
 def _brew_pkg(missing: list[str]) -> list[str]:

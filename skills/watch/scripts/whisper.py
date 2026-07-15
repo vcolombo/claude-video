@@ -14,16 +14,16 @@ import io
 import json
 import math
 import mimetypes
-import os
-import shutil
 import ssl
-import subprocess
 import sys
 import time
 import urllib.error
 import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
+
+from config import env_value
+from frames import FFPROBE_TIMEOUT, _require, _run_media
 
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -66,46 +66,17 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
     """Return (backend, api_key). Prefers Groq, falls back to OpenAI.
 
     If `preferred` is "groq" or "openai", only that backend's key is considered.
+    Keys come from the process environment or ``~/.config/watch/.env`` (via the
+    shared parser). A current-working-directory ``.env`` is deliberately NOT
+    consulted — running /watch inside a repo that happens to carry one must not
+    silently borrow (or be fed) an unrelated API key.
     """
-    def _from_env(name: str) -> str | None:
-        value = os.environ.get(name)
-        return value.strip() if value else None
-
-    def _from_dotenv(path: Path, name: str) -> str | None:
-        if not path.exists():
-            return None
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                if key.strip() != name:
-                    continue
-                value = value.strip()
-                if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
-                    value = value[1:-1]
-                return value or None
-        except OSError:
-            return None
-        return None
-
-    dotenv_paths = [
-        Path.home() / ".config" / "watch" / ".env",
-        Path.cwd() / ".env",
-    ]
-
     candidates = (("GROQ_API_KEY", "groq"), ("OPENAI_API_KEY", "openai"))
     if preferred is not None:
         candidates = tuple(c for c in candidates if c[1] == preferred)
 
     for key_name, backend in candidates:
-        value = _from_env(key_name)
-        if not value:
-            for candidate in dotenv_paths:
-                value = _from_dotenv(candidate, key_name)
-                if value:
-                    break
+        value = env_value(key_name)
         if value:
             return backend, value
 
@@ -114,8 +85,7 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
 
 def extract_audio(video_path: str, out_path: Path) -> Path:
     """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
-    if shutil.which("ffmpeg") is None:
-        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+    _require("ffmpeg")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -131,7 +101,7 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
         "-b:a", "64k",
         str(out_path.resolve()),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run_media(cmd)
     if result.returncode != 0:
         raise SystemExit(f"ffmpeg audio extraction failed: {result.stderr.strip()}")
     if not out_path.exists() or out_path.stat().st_size == 0:
@@ -141,10 +111,9 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
 
 def audio_duration(audio_path: Path) -> float:
     """Return the duration of an audio file in seconds via ffprobe."""
-    if shutil.which("ffprobe") is None:
-        raise SystemExit("ffprobe is not installed. Install with: brew install ffmpeg")
+    _require("ffprobe")
 
-    result = subprocess.run(
+    result = _run_media(
         [
             "ffprobe",
             "-v", "quiet",
@@ -152,8 +121,7 @@ def audio_duration(audio_path: Path) -> float:
             "-show_format",
             str(audio_path.resolve()),
         ],
-        capture_output=True,
-        text=True,
+        timeout=FFPROBE_TIMEOUT,
     )
     if result.returncode != 0:
         raise SystemExit(f"ffprobe failed: {result.stderr.strip()}")
@@ -171,8 +139,7 @@ def split_audio(
     Uses stream copy (`-c copy`) so there is no re-encode and no quality loss;
     mp3 frame boundaries are close enough for transcription's purposes.
     """
-    if shutil.which("ffmpeg") is None:
-        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+    _require("ffmpeg")
 
     work_dir.mkdir(parents=True, exist_ok=True)
     chunks: list[tuple[Path, float]] = []
@@ -189,7 +156,7 @@ def split_audio(
             "-c", "copy",
             str(out_path.resolve()),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _run_media(cmd)
         if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
             raise SystemExit(
                 f"ffmpeg failed to split audio chunk {index + 1}: {result.stderr.strip()}"
@@ -261,7 +228,7 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
             with urlopen(request, timeout=300, context=context) as response:
                 payload = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
-            detail = _read_error_body(exc)
+            detail = _error_summary(exc)
             last_exc, last_detail = exc, detail
 
             # 4xx other than 429 are client errors — no retry will fix them.
@@ -306,7 +273,13 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
     )
 
 
-def _read_error_body(exc: urllib.error.HTTPError) -> str:
+def _error_summary(exc: urllib.error.HTTPError) -> str:
+    """Return a short, safe hint from a provider error response.
+
+    Only the structured ``error.message`` field is surfaced (capped), never the
+    raw body — a reflected error body could echo request material into logs or
+    the agent's context. Falls back to empty so callers show just the status.
+    """
     try:
         body = exc.read()
     except Exception:
@@ -314,9 +287,13 @@ def _read_error_body(exc: urllib.error.HTTPError) -> str:
     if not body:
         return ""
     try:
-        return f" — {body.decode('utf-8', errors='replace')[:400]}"
-    except Exception:
-        return ""
+        data = json.loads(body.decode("utf-8", errors="replace"))
+        message = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+        if isinstance(message, str) and message.strip():
+            return f" — {message.strip()[:150]}"
+    except (ValueError, AttributeError):
+        pass
+    return ""
 
 
 def _retry_after(exc: urllib.error.HTTPError) -> float | None:
