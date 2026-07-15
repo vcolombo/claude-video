@@ -200,3 +200,14 @@ def test_watched_run_returns_when_process_finishes(tmp_path):
     cmd = [sys.executable, "-c", "pass"]
     result = download._run_ytdlp_watched(cmd, timeout=30, watch_dir=wd, max_bytes=10 * 1024 * 1024)
     assert result.returncode == 0
+
+
+def test_watched_run_catches_fast_finishing_over_quota(tmp_path):
+    # Codex round-2 finding: a child that crosses the cap and exits inside the
+    # first poll interval must still be caught by the final post-loop check.
+    wd = tmp_path / "dl"
+    wd.mkdir()
+    cmd = [sys.executable, "-c", f"open(r'{wd / 'big.bin'}','wb').write(b'x' * (8 * 1024 * 1024))"]
+    with pytest.raises(SystemExit):
+        download._run_ytdlp_watched(cmd, timeout=30, watch_dir=wd, max_bytes=4 * 1024 * 1024)
+    assert not wd.exists() or download._dir_size(wd) == 0

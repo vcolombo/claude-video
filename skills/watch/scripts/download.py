@@ -29,6 +29,9 @@ MAX_FILESIZE = "4G"
 # Aggregate ceiling across ALL files a download produces (fragments, separate
 # a/v, subs) — enforced by a watchdog because --max-filesize is per-file only.
 MAX_TOTAL_BYTES = 5 * 1024 ** 3  # 5 GiB
+# The caption/metadata pass is --skip-download, but subtitle/info responses are
+# still written to disk with no per-file cap, so it gets its own tighter ceiling.
+MAX_CAPTION_BYTES = 256 * 1024 * 1024  # 256 MiB
 # yt-dlp reads config (yt-dlp.conf) from the CWD and other locations, and config
 # can carry --exec → arbitrary command execution. Run hermetically everywhere.
 IGNORE_CONFIG = ["--ignore-config"]
@@ -115,21 +118,6 @@ def _pick_video(out_dir: Path) -> Path | None:
     return None
 
 
-def _run_ytdlp(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
-    """Run a yt-dlp argv, streaming its output to stderr, with a hard timeout.
-
-    A live stream or a stalled connection would otherwise block until the
-    caller's own timeout (if any) kills us, leaving a half-written temp dir.
-    """
-    try:
-        return subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise SystemExit(
-            f"yt-dlp timed out after {timeout}s — the source may be a live stream or "
-            "an unreachable host. Try a specific clip URL, or --start/--end on a finite video."
-        )
-
-
 def _dir_size(path: Path) -> int:
     """Total bytes of all files under ``path`` (OSError-tolerant)."""
     total = 0
@@ -170,16 +158,30 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 
 
 def _run_ytdlp_watched(
-    cmd: list[str], timeout: int, watch_dir: Path, max_bytes: int
+    cmd: list[str], timeout: int, watch_dir: Path, max_bytes: int, kind: str = "download"
 ) -> subprocess.CompletedProcess:
-    """Run a downloading yt-dlp argv under a disk+time watchdog.
+    """Run a yt-dlp argv under a disk+time watchdog.
 
     ``--max-filesize`` only bounds a single file; a fragmented (HLS/DASH) or
-    multi-stream download can still fill the disk. Poll the aggregate size of
+    multi-stream download — or an attacker-controlled subtitle/metadata response
+    on the caption pass — can still fill the disk. Poll the aggregate size of
     ``watch_dir`` and the elapsed time, and on breach kill the process group,
-    delete the partial download, and raise. ``start_new_session`` puts yt-dlp
-    (and the ffmpeg it spawns) in their own group so one kill reaps the tree.
+    delete the partial output, and raise. ``start_new_session`` puts yt-dlp (and
+    the ffmpeg it spawns) in their own group so one kill reaps the tree. The size
+    is also checked once more after the process exits, so a burst that crosses the
+    cap and finishes inside a poll interval can't slip through on the fast path.
     """
+    mb_cap = max_bytes // (1024 * 1024)
+
+    def _over_quota() -> None:
+        _kill_process_group(proc)
+        shutil.rmtree(watch_dir, ignore_errors=True)
+        raise SystemExit(
+            f"{kind} exceeded the {mb_cap} MiB aggregate disk cap and was aborted "
+            "(fragmented, oversized, or hostile source). "
+            "Use --start/--end to grab a section instead."
+        )
+
     proc = subprocess.Popen(
         cmd, stdout=sys.stderr, stderr=sys.stderr, start_new_session=True
     )
@@ -200,16 +202,14 @@ def _run_ytdlp_watched(
                     "--start/--end on a finite video."
                 )
             if _dir_size(watch_dir) > max_bytes:
-                _kill_process_group(proc)
-                shutil.rmtree(watch_dir, ignore_errors=True)
-                raise SystemExit(
-                    f"download exceeded the {max_bytes // (1024 ** 3)} GiB aggregate "
-                    "disk cap and was aborted (fragmented or oversized source). "
-                    "Use --start/--end to grab a section instead."
-                )
+                _over_quota()
     finally:
         if proc.poll() is None:
             _kill_process_group(proc)
+    # Final check: a burst that crossed the cap and exited within the last poll
+    # interval would otherwise be accepted on the completion path.
+    if _dir_size(watch_dir) > max_bytes:
+        _over_quota()
     return subprocess.CompletedProcess(cmd, proc.returncode)
 
 
@@ -244,7 +244,10 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "--",
         url,
     ]
-    result = _run_ytdlp(cmd, timeout=CAPTIONS_TIMEOUT)
+    result = _run_ytdlp_watched(
+        cmd, timeout=CAPTIONS_TIMEOUT, watch_dir=out_dir,
+        max_bytes=MAX_CAPTION_BYTES, kind="caption fetch",
+    )
     info = _read_info(out_dir / "video.info.json", url)
     # yt-dlp exiting non-zero with no info.json usually means the video is
     # unavailable (private / age-restricted / geo-blocked / removed). Surface it
@@ -261,14 +264,15 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
     # paying for a Whisper pass. Bounded to one extra fetch, one language.
     lang = (info or {}).get("language")
     if subtitle is None and lang and not str(lang).lower().startswith("en"):
-        _run_ytdlp(
+        _run_ytdlp_watched(
             [
                 "yt-dlp", *IGNORE_CONFIG, "--skip-download",
                 *_sub_args(f"{lang}.*,-live_chat"),
                 "--no-playlist", "--ignore-errors",
                 "-o", output_template, "--", url,
             ],
-            timeout=CAPTIONS_TIMEOUT,
+            timeout=CAPTIONS_TIMEOUT, watch_dir=out_dir,
+            max_bytes=MAX_CAPTION_BYTES, kind="caption fetch",
         )
         subtitle = _pick_subtitle(out_dir)
     return {

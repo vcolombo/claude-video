@@ -192,3 +192,31 @@ def test_cap_total_frames_preserves_cues_and_deletes_dropped(tmp_path):
     kept_paths = {f["path"] for f in kept}
     for f in frames_in:
         assert Path(f["path"]).exists() == (f["path"] in kept_paths)
+
+
+def test_cap_total_frames_single_budget_slot_no_crash():
+    # Codex round-2: budget == 1 (ceiling - cues) must not ZeroDivision.
+    frames_in = [{"index": 0, "timestamp_seconds": 0.0, "path": "c", "reason": "transcript-cue"}]
+    frames_in += [
+        {"index": i, "timestamp_seconds": float(i), "path": f"f{i}", "reason": "scene-change"}
+        for i in range(1, 50)
+    ]
+    kept, _dropped = watch._cap_total_frames(frames_in, 2)
+    assert len(kept) == 2
+    assert any(f["reason"] == "transcript-cue" for f in kept)
+
+
+def test_cap_total_frames_bounds_excess_cues(tmp_path):
+    # Codex round-2: cues alone exceeding the ceiling must be thinned too — a flood
+    # of --timestamps can't smuggle unbounded frames past the cap.
+    frames_in = []
+    for i in range(600):
+        p = tmp_path / f"c_{i:04d}.jpg"
+        p.write_bytes(b"x")
+        frames_in.append(
+            {"index": i, "timestamp_seconds": float(i), "path": str(p), "reason": "transcript-cue"}
+        )
+    kept, dropped = watch._cap_total_frames(frames_in, 500)
+    assert len(kept) == 500  # absolute ceiling honored even for pure cues
+    assert dropped == 100
+    assert all(f["reason"] == "transcript-cue" for f in kept)

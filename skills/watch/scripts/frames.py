@@ -27,10 +27,6 @@ SCENE_MIN_FRAMES = 8
 # Below this many decoded keyframes a clip is too sparse for keyframe coverage
 # (very short or oddly encoded), so the cheap tier falls back to uniform.
 KEYFRAME_MIN = 4
-# Upper bound on scene-change candidates ffmpeg will materialize in one pass.
-# Generous enough that any realistic clip is fully detected before even-sampling,
-# but bounds transient JPEG/CPU cost on a pathological rapid-cut source.
-SCENE_DETECT_CAP = 1200
 MAX_READ_DIMENSION = 1998
 # Frame-delta dedup: downscale each frame to a DEDUP_THUMB x DEDUP_THUMB
 # grayscale thumbnail and treat two frames as near-identical when their mean
@@ -550,21 +546,21 @@ def extract_scene_or_uniform(
     """Prefer scene selection, falling back to uniform only when the video is
     effectively static (fewer than ``SCENE_MIN_FRAMES`` detected shots).
 
-    Scene cuts are detected across the whole range up to ``SCENE_DETECT_CAP``,
-    near-identical frames are dropped (:func:`dedupe_perceptual`, unless ``dedup``
-    is False), and the survivors are even-sampled down to ``max_frames`` via
-    :func:`_even_sample`, exactly like the keyframe engine. Detecting all cuts
-    (rather than capping at ``max_frames``) keeps coverage spanning the entire
-    clip instead of only the first N cuts, but a generous ``SCENE_DETECT_CAP``
-    still bounds how many candidate JPEGs a pathological rapid-cut source can
-    materialize before the even-sample thins them (only clips with more than
-    ``SCENE_DETECT_CAP`` cuts lose their tail).
+    Scene cuts are detected across the *whole* range (uncapped), near-identical
+    frames are dropped (:func:`dedupe_perceptual`, unless ``dedup`` is False),
+    and the survivors are even-sampled down to ``max_frames`` via
+    :func:`_even_sample`, exactly like the keyframe engine. Detection is NOT
+    capped with ``-frames:v`` — that would stop after the first N cuts (a
+    chronological prefix) and silently drop the tail of a long or cut-heavy
+    video. Transient candidate JPEGs are instead bounded by the already-capped
+    download (720p + aggregate size cap) and deleted immediately by the
+    even-sample, so full-range coverage is preserved without unbounded materialization.
     """
     scene_frames = extract_scene_candidates(
         video_path,
         out_dir,
         resolution=resolution,
-        max_frames=SCENE_DETECT_CAP,
+        max_frames=None,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
     )

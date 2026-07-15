@@ -58,42 +58,45 @@ def validate_range(start_sec: float | None, end_sec: float | None, full_duration
 
 
 def _cap_total_frames(frames: list[dict], ceiling: int) -> tuple[list[dict], int]:
-    """Even-sample a frame list down to ``ceiling`` while never evicting pinned
-    transcript-cue frames, deleting the JPEGs it drops, and reindexing.
+    """Even-sample a frame list down to ``ceiling``, favouring pinned cue frames,
+    deleting the JPEGs it drops, and reindexing.
 
     Cue frames (``reason == "transcript-cue"``) are the moments the user
-    explicitly asked for, so they are always kept; only the remaining detail
-    frames are thinned to fill the leftover budget. Returns (kept, dropped)."""
+    explicitly asked for, so the leftover budget goes to detail frames first. But
+    the ceiling is absolute: if the cues alone exceed it, even the cues are
+    thinned — a caller can't smuggle unbounded frames past the cap with a flood of
+    ``--timestamps``. ``ceiling`` is assumed >= 1. Returns (kept, dropped)."""
     if len(frames) <= ceiling:
         return frames, 0
+    ceiling = max(1, ceiling)
     cues = [f for f in frames if f.get("reason") == "transcript-cue"]
     others = [f for f in frames if f.get("reason") != "transcript-cue"]
-    budget = max(0, ceiling - len(cues))
-    if budget <= 0:
-        keep_others: list[dict] = []
-    elif budget >= len(others):
-        keep_others = others
-    else:
-        idx = sorted({round(i * (len(others) - 1) / (budget - 1)) for i in range(budget)})
-        keep_others = [others[i] for i in idx]
 
-    keep_paths = {f["path"] for f in cues} | {f["path"] for f in keep_others}
+    if len(cues) >= ceiling:
+        keep_cues = [cues[i] for i in _even_indices(len(cues), ceiling)]
+        keep_others: list[dict] = []
+    else:
+        keep_cues = cues
+        budget = ceiling - len(cues)  # >= 1
+        keep_others = [others[i] for i in _even_indices(len(others), budget)]
+
+    keep_paths = {f["path"] for f in keep_cues} | {f["path"] for f in keep_others}
     dropped = 0
-    for f in others:
+    for f in frames:
         if f["path"] not in keep_paths:
             dropped += 1
             try:
                 Path(f["path"]).unlink()
             except OSError:
                 pass
-    kept = sorted(cues + keep_others, key=lambda f: f["timestamp_seconds"])
+    kept = sorted(keep_cues + keep_others, key=lambda f: f["timestamp_seconds"])
     for i, frame in enumerate(kept):
         frame["index"] = i
     return kept, dropped
 
 from config import frame_cap, get_config  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import MAX_FPS, _even_indices, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -324,12 +327,12 @@ def main() -> int:
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
 
-    # Final backstop: never hand the agent more than HARD_FRAME_CEILING frames to
-    # Read (cue frames are preserved; dropped JPEGs are deleted). The engines
-    # already bound their output, so this only fires in degenerate cases.
+    # Final backstop: never hand the agent more than the effective ceiling
+    # (frame_ceiling honors an explicit --max-frames, else HARD_FRAME_CEILING).
+    # Cue frames are favoured but the ceiling is absolute; dropped JPEGs deleted.
     ceiling_dropped = 0
-    if len(frames) > HARD_FRAME_CEILING:
-        frames, ceiling_dropped = _cap_total_frames(frames, HARD_FRAME_CEILING)
+    if len(frames) > frame_ceiling:
+        frames, ceiling_dropped = _cap_total_frames(frames, frame_ceiling)
         print(
             f"[watch] selected {len(frames) + ceiling_dropped} frames — "
             f"capped to {len(frames)} (evenly sampled, cues kept). Pass --max-frames to change.",
