@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,8 +24,14 @@ VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 # yt-dlp can otherwise hang forever on a live stream or a stalled connection.
 CAPTIONS_TIMEOUT = 180   # metadata + subtitle fetch only (--skip-download)
 DOWNLOAD_TIMEOUT = 900   # full media download
-# Ceiling on a single download so a malicious/huge stream can't fill the disk.
+# Per-file ceiling (early yt-dlp reject) so a single huge stream can't fill disk.
 MAX_FILESIZE = "4G"
+# Aggregate ceiling across ALL files a download produces (fragments, separate
+# a/v, subs) — enforced by a watchdog because --max-filesize is per-file only.
+MAX_TOTAL_BYTES = 5 * 1024 ** 3  # 5 GiB
+# yt-dlp reads config (yt-dlp.conf) from the CWD and other locations, and config
+# can carry --exec → arbitrary command execution. Run hermetically everywhere.
+IGNORE_CONFIG = ["--ignore-config"]
 
 
 def is_url(source: str) -> bool:
@@ -33,13 +42,20 @@ def is_url(source: str) -> bool:
 
 
 def reject_internal_url(url: str) -> None:
-    """Refuse URLs that resolve to a loopback/private/link-local/reserved host.
+    """Refuse URLs that resolve to a non-globally-routable host.
 
     /watch treats input URLs as untrusted (they can arrive via prompt injection
     or shared automation). Without this, yt-dlp would happily fetch internal
     endpoints — cloud metadata (169.254.169.254), localhost admin panels, RFC1918
     services — turning the skill into an SSRF primitive. Resolve the host and
-    block if ANY resolved address is internal.
+    block if ANY resolved address is not globally routable (``is_global`` also
+    catches CGNAT 100.64/10, 0.0.0.0/8, TEST-NET, and other non-public ranges the
+    individual predicates miss).
+
+    This is best-effort defense-in-depth only: yt-dlp re-resolves the host, follows
+    redirects, and fetches manifest/fragment URLs this single pre-flight check never
+    sees, so DNS rebinding or a public→private redirect can still slip through. For
+    genuinely untrusted input, run under a network egress policy (see SKILL.md).
     """
     host = urlparse(url).hostname
     if not host:
@@ -54,16 +70,9 @@ def reject_internal_url(url: str) -> None:
             ip = ipaddress.ip_address(addr.split("%")[0])  # strip IPv6 zone id
         except ValueError:
             continue
-        if (
-            ip.is_loopback
-            or ip.is_private
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
+        if not ip.is_global:
             raise SystemExit(
-                f"Refusing to fetch internal/private address ({ip}) for host {host!r}. "
+                f"Refusing to fetch non-public address ({ip}) for host {host!r}. "
                 "/watch only fetches public video URLs."
             )
 
@@ -121,6 +130,89 @@ def _run_ytdlp(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
         )
 
 
+def _dir_size(path: Path) -> int:
+    """Total bytes of all files under ``path`` (OSError-tolerant)."""
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Terminate the whole process tree (yt-dlp spawns ffmpeg for merges).
+
+    Uses the POSIX process group when available; falls back to killing just the
+    process (best effort) on platforms without ``killpg`` (Windows)."""
+    def _signal(sig) -> bool:
+        try:
+            os.killpg(proc.pid, sig)
+            return True
+        except (AttributeError, ProcessLookupError, PermissionError, OSError):
+            return False
+
+    if not _signal(signal.SIGTERM):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if not _signal(signal.SIGKILL):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def _run_ytdlp_watched(
+    cmd: list[str], timeout: int, watch_dir: Path, max_bytes: int
+) -> subprocess.CompletedProcess:
+    """Run a downloading yt-dlp argv under a disk+time watchdog.
+
+    ``--max-filesize`` only bounds a single file; a fragmented (HLS/DASH) or
+    multi-stream download can still fill the disk. Poll the aggregate size of
+    ``watch_dir`` and the elapsed time, and on breach kill the process group,
+    delete the partial download, and raise. ``start_new_session`` puts yt-dlp
+    (and the ffmpeg it spawns) in their own group so one kill reaps the tree.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=sys.stderr, stderr=sys.stderr, start_new_session=True
+    )
+    start = time.monotonic()
+    try:
+        while True:
+            try:
+                proc.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() - start > timeout:
+                _kill_process_group(proc)
+                shutil.rmtree(watch_dir, ignore_errors=True)
+                raise SystemExit(
+                    f"yt-dlp timed out after {timeout}s — the source may be a live "
+                    "stream or an unreachable host. Try a specific clip URL, or "
+                    "--start/--end on a finite video."
+                )
+            if _dir_size(watch_dir) > max_bytes:
+                _kill_process_group(proc)
+                shutil.rmtree(watch_dir, ignore_errors=True)
+                raise SystemExit(
+                    f"download exceeded the {max_bytes // (1024 ** 3)} GiB aggregate "
+                    "disk cap and was aborted (fragmented or oversized source). "
+                    "Use --start/--end to grab a section instead."
+                )
+    finally:
+        if proc.poll() is None:
+            _kill_process_group(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode)
+
+
 def _sub_args(langs: str = "en.*,-live_chat") -> list[str]:
     """yt-dlp captions/subs args, shared by fetch_captions and download_url."""
     return [
@@ -142,6 +234,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
     output_template = str(out_dir / "video.%(ext)s")
     cmd = [
         "yt-dlp",
+        *IGNORE_CONFIG,
         "--skip-download",
         "--write-info-json",
         *_sub_args(),
@@ -170,7 +263,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
     if subtitle is None and lang and not str(lang).lower().startswith("en"):
         _run_ytdlp(
             [
-                "yt-dlp", "--skip-download",
+                "yt-dlp", *IGNORE_CONFIG, "--skip-download",
                 *_sub_args(f"{lang}.*,-live_chat"),
                 "--no-playlist", "--ignore-errors",
                 "-o", output_template, "--", url,
@@ -220,12 +313,13 @@ def download_url(
     fmt = "ba/bestaudio" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
     cmd = [
         "yt-dlp",
+        *IGNORE_CONFIG,
         "-N", "8",
         "-f", fmt,
         "--merge-output-format", "mp4",
         # Refuse live streams up front (they never "finish", so a plain download
-        # would run until the timeout) and cap size so a huge stream can't fill
-        # the disk.
+        # would run until the timeout) and cap per-file size. The aggregate cap
+        # across all produced files is enforced by the watchdog below.
         "--match-filter", "!is_live",
         "--max-filesize", MAX_FILESIZE,
         "--write-info-json",
@@ -239,7 +333,9 @@ def download_url(
 
     # yt-dlp may exit non-zero if a subtitle variant fails (e.g. 429) even when
     # the video itself downloaded fine. Treat "video file present" as success.
-    result = _run_ytdlp(cmd, timeout=DOWNLOAD_TIMEOUT)
+    result = _run_ytdlp_watched(
+        cmd, timeout=DOWNLOAD_TIMEOUT, watch_dir=out_dir, max_bytes=MAX_TOTAL_BYTES
+    )
     video = _pick_video(out_dir)
     if video is None:
         raise SystemExit(

@@ -87,3 +87,37 @@ def test_env_value_blank_env_is_unset(monkeypatch, tmp_path):
     p = _env(tmp_path, "GROQ_API_KEY=from-file\n")
     monkeypatch.setenv("GROQ_API_KEY", "   ")
     assert config.env_value("GROQ_API_KEY", p) == "from-file"
+
+
+# --- quote/comment compose (Codex finding 5): must not create false-ready keys ---
+
+def test_quoted_value_with_trailing_comment_drops_quotes(tmp_path):
+    p = _env(tmp_path, "GROQ_API_KEY='sk-x'  # note\n")
+    assert config.parse_env_file(p)["GROQ_API_KEY"] == "sk-x"
+
+
+def test_double_quoted_value_with_trailing_comment(tmp_path):
+    p = _env(tmp_path, 'GROQ_API_KEY="sk-y"  # note\n')
+    assert config.parse_env_file(p)["GROQ_API_KEY"] == "sk-y"
+
+
+def test_blank_value_with_comment_is_empty(tmp_path):
+    # `KEY=  # optional` must resolve to unset, not the literal "# optional".
+    p = _env(tmp_path, "GROQ_API_KEY=  # optional\n")
+    assert config.parse_env_file(p)["GROQ_API_KEY"] == ""
+
+
+def test_blank_commented_key_reads_as_unset(monkeypatch, tmp_path):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    p = _env(tmp_path, "GROQ_API_KEY=  # optional\n")
+    assert config.env_value("GROQ_API_KEY", p) is None
+
+
+def test_embedded_hash_without_space_kept(tmp_path):
+    p = _env(tmp_path, "GROQ_API_KEY=sk-a#b\n")
+    assert config.parse_env_file(p)["GROQ_API_KEY"] == "sk-a#b"
+
+
+def test_hash_inside_quotes_kept(tmp_path):
+    p = _env(tmp_path, "GROQ_API_KEY=\"sk-a#b\"  # tail\n")
+    assert config.parse_env_file(p)["GROQ_API_KEY"] == "sk-a#b"

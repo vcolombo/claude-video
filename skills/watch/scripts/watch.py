@@ -58,17 +58,38 @@ def validate_range(start_sec: float | None, end_sec: float | None, full_duration
 
 
 def _cap_total_frames(frames: list[dict], ceiling: int) -> tuple[list[dict], int]:
-    """Even-sample a frame list down to ``ceiling`` (first + last kept), reindex.
+    """Even-sample a frame list down to ``ceiling`` while never evicting pinned
+    transcript-cue frames, deleting the JPEGs it drops, and reindexing.
 
-    Backstop for uncapped (token-burner) selection; JPEGs left on disk are
-    harmless in the work dir. Returns (kept, dropped_count)."""
+    Cue frames (``reason == "transcript-cue"``) are the moments the user
+    explicitly asked for, so they are always kept; only the remaining detail
+    frames are thinned to fill the leftover budget. Returns (kept, dropped)."""
     if len(frames) <= ceiling:
         return frames, 0
-    idx = sorted({round(i * (len(frames) - 1) / (ceiling - 1)) for i in range(ceiling)})
-    kept = [frames[i] for i in idx]
+    cues = [f for f in frames if f.get("reason") == "transcript-cue"]
+    others = [f for f in frames if f.get("reason") != "transcript-cue"]
+    budget = max(0, ceiling - len(cues))
+    if budget <= 0:
+        keep_others: list[dict] = []
+    elif budget >= len(others):
+        keep_others = others
+    else:
+        idx = sorted({round(i * (len(others) - 1) / (budget - 1)) for i in range(budget)})
+        keep_others = [others[i] for i in idx]
+
+    keep_paths = {f["path"] for f in cues} | {f["path"] for f in keep_others}
+    dropped = 0
+    for f in others:
+        if f["path"] not in keep_paths:
+            dropped += 1
+            try:
+                Path(f["path"]).unlink()
+            except OSError:
+                pass
+    kept = sorted(cues + keep_others, key=lambda f: f["timestamp_seconds"])
     for i, frame in enumerate(kept):
         frame["index"] = i
-    return kept, len(frames) - len(kept)
+    return kept, dropped
 
 from config import frame_cap, get_config  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
@@ -244,6 +265,11 @@ def main() -> int:
     cue_frames: list[dict] = []
     cue_meta: dict = {}
 
+    # Effective per-run ceiling: token-burner leaves max_frames unset (None), but
+    # extraction must still be bounded so a rapid-cut clip can't materialize
+    # thousands of JPEGs — cap it at HARD_FRAME_CEILING for reservation math.
+    frame_ceiling = max_frames if max_frames is not None else HARD_FRAME_CEILING
+
     # Transcript cues are pinned: extracted first and counted against the cap so
     # the detail engine never evicts the moments the user explicitly asked for.
     if cue_timestamps and video_path and has_video:
@@ -252,7 +278,7 @@ def main() -> int:
             work / "frames",
             cue_timestamps,
             resolution=args.resolution,
-            max_frames=max_frames,
+            max_frames=frame_ceiling,
             start_seconds=start_sec,
             end_seconds=end_sec,
         )
@@ -263,9 +289,9 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-    detail_budget = max_frames if max_frames is None else max(0, max_frames - len(cue_frames))
+    detail_budget = max(0, frame_ceiling - len(cue_frames))
     if detail != "transcript" and video_path and has_video and detail_budget != 0:
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
+        cap_label = str(detail_budget)
         engine_label = "keyframes" if detail == "efficient" else "scene-aware frames"
         print(
             f"[watch] extracting {engine_label} over {scope} "
@@ -298,14 +324,15 @@ def main() -> int:
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
 
-    # Backstop for uncapped (token-burner) selection: never hand the agent more
-    # than HARD_FRAME_CEILING frames to Read, no matter how many scene cuts exist.
+    # Final backstop: never hand the agent more than HARD_FRAME_CEILING frames to
+    # Read (cue frames are preserved; dropped JPEGs are deleted). The engines
+    # already bound their output, so this only fires in degenerate cases.
     ceiling_dropped = 0
-    if max_frames is None and len(frames) > HARD_FRAME_CEILING:
+    if len(frames) > HARD_FRAME_CEILING:
         frames, ceiling_dropped = _cap_total_frames(frames, HARD_FRAME_CEILING)
         print(
-            f"[watch] token-burner selected {len(frames) + ceiling_dropped} frames — "
-            f"capped to {HARD_FRAME_CEILING} (evenly sampled). Pass --max-frames to change.",
+            f"[watch] selected {len(frames) + ceiling_dropped} frames — "
+            f"capped to {len(frames)} (evenly sampled, cues kept). Pass --max-frames to change.",
             file=sys.stderr,
         )
 
@@ -371,7 +398,7 @@ def main() -> int:
     if detail != "transcript" and video_path and not has_video:
         print("- **Frames:** skipped (source has no video stream)")
     elif detail != "transcript":
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
+        cap_label = str(detail_budget)
         engine = frame_meta.get("engine", "scene")
         fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
         deduped = frame_meta.get("deduped_count", 0)
@@ -383,10 +410,13 @@ def main() -> int:
     elif not cue_frames:
         print("- **Frames:** skipped (transcript detail)")
     if cue_frames:
+        # Count survivors in the final list — the ceiling backstop preserves cues,
+        # but report what actually shipped rather than the pre-cap count.
+        surviving_cues = sum(1 for f in frames if f.get("reason") == "transcript-cue")
         dropped = cue_meta.get("dropped_out_of_window", 0)
         drop_note = f", {dropped} dropped outside range" if dropped else ""
         print(
-            f"- **Cue frames:** {len(cue_frames)} at transcript-flagged timestamps "
+            f"- **Cue frames:** {surviving_cues} at transcript-flagged timestamps "
             f"(transcript-cue{drop_note})"
         )
     if frames:
@@ -403,8 +433,8 @@ def main() -> int:
     if ceiling_dropped:
         print()
         print(
-            f"> **Warning:** token-burner selected {len(frames) + ceiling_dropped} frames; "
-            f"capped to {len(frames)} (evenly sampled) to protect context. "
+            f"> **Warning:** {len(frames) + ceiling_dropped} frames were selected; "
+            f"capped to {len(frames)} (evenly sampled, cue frames kept) to protect context. "
             "Pass `--max-frames N` or `--start/--end` for finer control."
         )
     elif detail == "token-burner" and len(frames) > 250:
