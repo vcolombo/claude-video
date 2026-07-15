@@ -68,3 +68,46 @@ def test_scene_fallback_on_static_clip(static_clip: Path, tmp_path: Path):
     )
     assert meta["engine"] == "uniform"
     assert meta["fallback"] is True
+
+
+# --- auto-fps budget math (pure, no ffmpeg) --------------------------------
+
+def test_auto_fps_never_exceeds_max_fps():
+    fps, _ = frames.auto_fps(10.0, max_frames=100)
+    assert fps <= frames.MAX_FPS
+
+
+def test_auto_fps_respects_frame_cap():
+    # A long video's target is bounded by max_frames.
+    _fps, target = frames.auto_fps(6000.0, max_frames=80)
+    assert target <= 80
+
+
+def test_auto_fps_short_clip_is_dense():
+    _fps, target = frames.auto_fps(20.0, max_frames=100)
+    assert target >= 12  # short clips get a floor of frames
+
+
+def test_auto_fps_zero_duration_uses_cap_not_single_frame():
+    # Regression: duration 0 (some webm/streamed files) once collapsed to 1
+    # frame. It must instead fall back to the frame cap.
+    fps, target = frames.auto_fps(0.0, max_frames=80)
+    assert target == 80
+    assert fps > 0
+
+
+def test_auto_fps_focus_zero_duration_uses_cap():
+    fps, target = frames.auto_fps_focus(0.0, max_frames=60)
+    assert target == 60
+    assert 0 < fps <= frames.MAX_FPS
+
+
+def test_auto_fps_focus_is_denser_than_full():
+    _f1, full = frames.auto_fps(30.0, max_frames=100)
+    _f2, focus = frames.auto_fps_focus(30.0, max_frames=100)
+    assert focus >= full  # zoomed-in ranges sample at least as densely
+
+
+def test_get_metadata_reports_has_video(cut_clip: Path):
+    meta = frames.get_metadata(str(cut_clip))
+    assert meta["has_video"] is True

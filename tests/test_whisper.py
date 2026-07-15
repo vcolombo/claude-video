@@ -1,12 +1,16 @@
-"""Whisper auto-chunking: plan, split, and timestamp stitching."""
+"""Whisper auto-chunking: plan, split, and timestamp stitching, plus key
+loading precedence, the error-body redaction, and the HTTP retry loop."""
 from __future__ import annotations
 
+import io
 import math
 import subprocess
+import urllib.error
 from pathlib import Path
 
 import pytest
 
+import config
 import whisper
 
 
@@ -155,3 +159,102 @@ class TestTranscribeChunks:
 
         with pytest.raises(SystemExit):
             whisper.transcribe_chunks(chunks, always_fail)
+
+
+class TestLoadApiKey:
+    def _no_env(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def test_prefers_groq_when_both_set(self, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "g")
+        monkeypatch.setenv("OPENAI_API_KEY", "o")
+        assert whisper.load_api_key() == ("groq", "g")
+
+    def test_preferred_openai_ignores_groq(self, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "g")
+        monkeypatch.setenv("OPENAI_API_KEY", "o")
+        assert whisper.load_api_key("openai") == ("openai", "o")
+
+    def test_falls_back_to_openai(self, monkeypatch):
+        self._no_env(monkeypatch)
+        monkeypatch.setenv("OPENAI_API_KEY", "o")
+        assert whisper.load_api_key() == ("openai", "o")
+
+    def test_reads_config_file(self, monkeypatch, tmp_path):
+        self._no_env(monkeypatch)
+        env = tmp_path / ".env"
+        env.write_text("GROQ_API_KEY=from-file\n", encoding="utf-8")
+        monkeypatch.setattr(config, "CONFIG_FILE", env)
+        assert whisper.load_api_key() == ("groq", "from-file")
+
+    def test_ignores_cwd_dotenv(self, monkeypatch, tmp_path):
+        # Regression (#9): a .env in the working directory must NOT be consulted,
+        # so running /watch inside an unrelated repo can't borrow its key.
+        self._no_env(monkeypatch)
+        (tmp_path / ".env").write_text("GROQ_API_KEY=should-be-ignored\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "missing.env")
+        assert whisper.load_api_key() == (None, None)
+
+
+def _http_error(code: int, body: bytes) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://api.example/x", code, "err", {}, io.BytesIO(body))
+
+
+class TestErrorSummary:
+    def test_extracts_structured_message(self):
+        exc = _http_error(401, b'{"error": {"message": "Invalid API Key"}}')
+        assert whisper._error_summary(exc) == " — Invalid API Key"
+
+    def test_ignores_unstructured_body(self):
+        # A raw/reflected body must never be surfaced verbatim.
+        exc = _http_error(500, b"<html>secret request echo</html>")
+        assert whisper._error_summary(exc) == ""
+
+    def test_empty_body_is_empty(self):
+        assert whisper._error_summary(_http_error(500, b"")) == ""
+
+
+class TestPostWhisperRetry:
+    def test_retries_after_429_then_succeeds(self, monkeypatch, tmp_path):
+        audio = tmp_path / "a.mp3"
+        audio.write_bytes(b"fake-audio")
+        monkeypatch.setattr(whisper.time, "sleep", lambda *_: None)
+
+        calls = {"n": 0}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"segments": [{"start": 0, "end": 1, "text": "ok"}]}'
+
+        def fake_urlopen(request, timeout=None, context=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _http_error(429, b'{"error": {"message": "slow down"}}')
+            return _Resp()
+
+        monkeypatch.setattr(whisper, "urlopen", fake_urlopen)
+        out = whisper._post_whisper("https://api.example/x", "key", "model", audio)
+        assert calls["n"] == 2  # retried once, then succeeded
+        assert out["segments"][0]["text"] == "ok"
+
+    def test_non_429_4xx_does_not_retry(self, monkeypatch, tmp_path):
+        audio = tmp_path / "a.mp3"
+        audio.write_bytes(b"fake-audio")
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None, context=None):
+            calls["n"] += 1
+            raise _http_error(401, b'{"error": {"message": "bad key"}}')
+
+        monkeypatch.setattr(whisper, "urlopen", fake_urlopen)
+        with pytest.raises(SystemExit):
+            whisper._post_whisper("https://api.example/x", "key", "model", audio)
+        assert calls["n"] == 1  # 401 is terminal, no retry

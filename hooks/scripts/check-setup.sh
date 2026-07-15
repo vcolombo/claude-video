@@ -50,7 +50,14 @@ fi
 
 # First-run / partially-configured → one-line hint.
 if [[ -z "$HAS_FFMPEG" || -z "$HAS_YTDLP" ]]; then
-  echo "/watch: needs ffmpeg + yt-dlp. Run \`python3 \$CLAUDE_PLUGIN_ROOT/skills/watch/scripts/setup.py\` once to install and scaffold config."
+  # Emit a real, pasteable path — CLAUDE_PLUGIN_ROOT only exists inside the hook
+  # env, so echoing the literal var name would break when the user copy-pastes.
+  if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+    setup_path="$CLAUDE_PLUGIN_ROOT/skills/watch/scripts/setup.py"
+  else
+    setup_path="<watch-plugin-dir>/skills/watch/scripts/setup.py"
+  fi
+  echo "/watch: needs ffmpeg + yt-dlp. Run \`python3 $setup_path\` once to install and scaffold config."
 elif [[ -z "$HAS_GROQ" && -z "$HAS_OPENAI" ]]; then
   echo "/watch: ready for videos with native captions. Add GROQ_API_KEY (preferred) or OPENAI_API_KEY to ~/.config/watch/.env to unlock Whisper fallback."
 else

@@ -6,8 +6,10 @@ transcribe.py can parse them without needing Whisper.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -16,12 +18,54 @@ from urllib.parse import urlparse
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 
+# yt-dlp can otherwise hang forever on a live stream or a stalled connection.
+CAPTIONS_TIMEOUT = 180   # metadata + subtitle fetch only (--skip-download)
+DOWNLOAD_TIMEOUT = 900   # full media download
+# Ceiling on a single download so a malicious/huge stream can't fill the disk.
+MAX_FILESIZE = "4G"
+
 
 def is_url(source: str) -> bool:
     if source.startswith("-"):
         return False
     parsed = urlparse(source)
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def reject_internal_url(url: str) -> None:
+    """Refuse URLs that resolve to a loopback/private/link-local/reserved host.
+
+    /watch treats input URLs as untrusted (they can arrive via prompt injection
+    or shared automation). Without this, yt-dlp would happily fetch internal
+    endpoints — cloud metadata (169.254.169.254), localhost admin panels, RFC1918
+    services — turning the skill into an SSRF primitive. Resolve the host and
+    block if ANY resolved address is internal.
+    """
+    host = urlparse(url).hostname
+    if not host:
+        raise SystemExit(f"Refusing to fetch URL with no host: {url!r}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise SystemExit(f"Cannot resolve host {host!r}: {exc}")
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr.split("%")[0])  # strip IPv6 zone id
+        except ValueError:
+            continue
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise SystemExit(
+                f"Refusing to fetch internal/private address ({ip}) for host {host!r}. "
+                "/watch only fetches public video URLs."
+            )
 
 
 def resolve_local(path: str) -> dict:
@@ -62,10 +106,37 @@ def _pick_video(out_dir: Path) -> Path | None:
     return None
 
 
+def _run_ytdlp(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a yt-dlp argv, streaming its output to stderr, with a hard timeout.
+
+    A live stream or a stalled connection would otherwise block until the
+    caller's own timeout (if any) kills us, leaving a half-written temp dir.
+    """
+    try:
+        return subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"yt-dlp timed out after {timeout}s — the source may be a live stream or "
+            "an unreachable host. Try a specific clip URL, or --start/--end on a finite video."
+        )
+
+
+def _sub_args(langs: str = "en.*,-live_chat") -> list[str]:
+    """yt-dlp captions/subs args, shared by fetch_captions and download_url."""
+    return [
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs", langs,
+        "--sub-format", "vtt",
+        "--convert-subs", "vtt",
+    ]
+
+
 def fetch_captions(url: str, out_dir: Path) -> dict:
     """Fetch metadata and best available VTT captions without downloading video."""
     if shutil.which("yt-dlp") is None:
-        raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
+        raise SystemExit("yt-dlp is not installed. Run setup.py to install it.")
+    reject_internal_url(url)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
@@ -73,20 +144,40 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "yt-dlp",
         "--skip-download",
         "--write-info-json",
-        "--write-subs",
-        "--write-auto-subs",
-        "--sub-langs", "en.*",
-        "--sub-format", "vtt",
-        "--convert-subs", "vtt",
+        *_sub_args(),
         "--no-playlist",
         "--ignore-errors",
         "-o", output_template,
         "--",
         url,
     ]
-    subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
-    subtitle = _pick_subtitle(out_dir)
+    result = _run_ytdlp(cmd, timeout=CAPTIONS_TIMEOUT)
     info = _read_info(out_dir / "video.info.json", url)
+    # yt-dlp exiting non-zero with no info.json usually means the video is
+    # unavailable (private / age-restricted / geo-blocked / removed). Surface it
+    # here rather than letting the caller mistake it for "no captions".
+    if result.returncode != 0 and not (out_dir / "video.info.json").exists():
+        print(
+            f"[watch] yt-dlp could not read this video (exit {result.returncode}) — "
+            "it may be private, age-restricted, region-locked, or removed.",
+            file=sys.stderr,
+        )
+    subtitle = _pick_subtitle(out_dir)
+    # No English track but the video has its own (non-English) subtitles: grab
+    # them so a foreign-language video can use its native captions instead of
+    # paying for a Whisper pass. Bounded to one extra fetch, one language.
+    lang = (info or {}).get("language")
+    if subtitle is None and lang and not str(lang).lower().startswith("en"):
+        _run_ytdlp(
+            [
+                "yt-dlp", "--skip-download",
+                *_sub_args(f"{lang}.*,-live_chat"),
+                "--no-playlist", "--ignore-errors",
+                "-o", output_template, "--", url,
+            ],
+            timeout=CAPTIONS_TIMEOUT,
+        )
+        subtitle = _pick_subtitle(out_dir)
     return {
         "video_path": None,
         "subtitle_path": str(subtitle) if subtitle else None,
@@ -104,6 +195,8 @@ def _read_info(info_path: Path, url: str) -> dict:
                 "title": raw.get("title"),
                 "uploader": raw.get("uploader") or raw.get("channel"),
                 "duration": raw.get("duration"),
+                "language": raw.get("language"),
+                "is_live": raw.get("is_live"),
                 "url": raw.get("webpage_url") or url,
             }
         except Exception as exc:
@@ -118,7 +211,8 @@ def download_url(
     audio_only: bool = False,
 ) -> dict:
     if shutil.which("yt-dlp") is None:
-        raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
+        raise SystemExit("yt-dlp is not installed. Run setup.py to install it.")
+    reject_internal_url(url)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
@@ -129,12 +223,13 @@ def download_url(
         "-N", "8",
         "-f", fmt,
         "--merge-output-format", "mp4",
+        # Refuse live streams up front (they never "finish", so a plain download
+        # would run until the timeout) and cap size so a huge stream can't fill
+        # the disk.
+        "--match-filter", "!is_live",
+        "--max-filesize", MAX_FILESIZE,
         "--write-info-json",
-        "--write-subs",
-        "--write-auto-subs",
-        "--sub-langs", "en.*",
-        "--sub-format", "vtt",
-        "--convert-subs", "vtt",
+        *_sub_args(),
         "--no-playlist",
         "--ignore-errors",
         "-o", output_template,
@@ -144,11 +239,13 @@ def download_url(
 
     # yt-dlp may exit non-zero if a subtitle variant fails (e.g. 429) even when
     # the video itself downloaded fine. Treat "video file present" as success.
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    result = _run_ytdlp(cmd, timeout=DOWNLOAD_TIMEOUT)
     video = _pick_video(out_dir)
     if video is None:
         raise SystemExit(
-            f"yt-dlp did not produce a video file in {out_dir} (exit {result.returncode})"
+            f"yt-dlp did not produce a video file in {out_dir} (exit {result.returncode}). "
+            "Likely causes: a live stream (unsupported), a file over the "
+            f"{MAX_FILESIZE} size cap, or an unavailable/region-locked video."
         )
 
     subtitle = _pick_subtitle(out_dir)

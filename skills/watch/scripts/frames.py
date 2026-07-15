@@ -38,6 +38,31 @@ DEDUP_THUMB = 16
 DEDUP_THRESHOLD = 2.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 
+# ffmpeg/ffprobe should never block indefinitely on a corrupt or truncated file.
+FFPROBE_TIMEOUT = 60
+FFMPEG_TIMEOUT = 900
+
+
+def _require(binary: str) -> None:
+    """Raise a harness-agnostic install hint if a required binary is absent.
+
+    Points at setup.py (which platform-branches) rather than naming brew, so the
+    message is correct on Linux/Windows too."""
+    if shutil.which(binary) is None:
+        setup_py = Path(__file__).resolve().parent / "setup.py"
+        raise SystemExit(
+            f"{binary} is not installed. Run `python3 {setup_py}` to install dependencies."
+        )
+
+
+def _run_media(cmd: list[str], timeout: int = FFMPEG_TIMEOUT, text: bool = True):
+    """Run an ffmpeg/ffprobe argv with a hard timeout, mapping a hang to a clean
+    SystemExit instead of blocking the whole /watch run forever."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"{cmd[0]} timed out after {timeout}s (possibly a corrupt or stalled input)")
+
 
 def _scale_filter(resolution: int) -> str:
     return (
@@ -84,10 +109,9 @@ def format_time(seconds: float) -> str:
 
 
 def get_metadata(video_path: str) -> dict:
-    if shutil.which("ffprobe") is None:
-        raise SystemExit("ffprobe is not installed. Install with: brew install ffmpeg")
+    _require("ffprobe")
 
-    result = subprocess.run(
+    result = _run_media(
         [
             "ffprobe",
             "-v", "quiet",
@@ -96,8 +120,7 @@ def get_metadata(video_path: str) -> dict:
             "-show_streams",
             str(Path(video_path).resolve()),
         ],
-        capture_output=True,
-        text=True,
+        timeout=FFPROBE_TIMEOUT,
     )
     if result.returncode != 0:
         raise SystemExit(f"ffprobe failed: {result.stderr.strip()}")
@@ -105,8 +128,9 @@ def get_metadata(video_path: str) -> dict:
     data = json.loads(result.stdout or "{}")
     streams = data.get("streams", [])
     fmt = data.get("format", {})
-    video_stream = next((s for s in streams if s.get("codec_type") == "video"), {})
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
     audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    video_stream = video_stream or {}
 
     duration = float(fmt.get("duration") or video_stream.get("duration") or 0)
     return {
@@ -116,13 +140,17 @@ def get_metadata(video_path: str) -> dict:
         "codec": video_stream.get("codec_name"),
         "size_bytes": int(fmt.get("size") or 0),
         "has_audio": audio_stream is not None,
+        "has_video": bool(video_stream),
     }
 
 
 def auto_fps(duration_seconds: float, max_frames: int = 100) -> tuple[float, int]:
     """Pick fps that targets a sensible frame budget for full-video scans."""
     if duration_seconds <= 0:
-        return 1.0, 1
+        # Some streamed/webm files report duration 0 from ffprobe. Rather than
+        # collapse to a single frame, sample at 1 fps and let the frame cap and
+        # the actual frame count bound it (the scene engine ignores fps anyway).
+        return 1.0, max_frames
 
     if duration_seconds <= 30:
         target = min(max_frames, max(12, int(round(duration_seconds))))
@@ -141,7 +169,7 @@ def auto_fps(duration_seconds: float, max_frames: int = 100) -> tuple[float, int
 def auto_fps_focus(duration_seconds: float, max_frames: int = 100) -> tuple[float, int]:
     """Denser budget for user-specified ranges — they are zooming in for detail."""
     if duration_seconds <= 0:
-        return min(MAX_FPS, 2.0), 2
+        return min(MAX_FPS, 2.0), max_frames
 
     if duration_seconds <= 5:
         target = min(max_frames, max(10, int(round(duration_seconds * 6))))
@@ -168,8 +196,7 @@ def extract(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
 ) -> list[dict]:
-    if shutil.which("ffmpeg") is None:
-        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+    _require("ffmpeg")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for existing in out_dir.glob("frame_*.jpg"):
@@ -197,7 +224,7 @@ def extract(
         output_pattern,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run_media(cmd)
     if result.returncode != 0:
         raise SystemExit(f"ffmpeg frame extraction failed: {result.stderr.strip()}")
 
@@ -230,8 +257,7 @@ def extract_scene_candidates(
     would only delete afterwards. ``None`` (uncapped "complete" detail) keeps
     every detected shot, as the user explicitly opted in.
     """
-    if shutil.which("ffmpeg") is None:
-        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+    _require("ffmpeg")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for existing in out_dir.glob("frame_*.jpg"):
@@ -261,7 +287,7 @@ def extract_scene_candidates(
         "-q:v", "4",
         output_pattern,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run_media(cmd)
     if result.returncode != 0:
         raise SystemExit(f"ffmpeg scene extraction failed: {result.stderr.strip()}")
 
@@ -338,8 +364,7 @@ def extract_at_timestamps(
     clobbering the other. When more cues than ``max_frames`` survive, they are
     even-sampled (first + last kept) before extraction.
     """
-    if shutil.which("ffmpeg") is None:
-        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+    _require("ffmpeg")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for existing in out_dir.glob("cue_*.jpg"):
@@ -371,7 +396,7 @@ def extract_at_timestamps(
             "-q:v", "4",
             str(path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _run_media(cmd)
         if result.returncode == 0 and path.exists():
             out.append({
                 "index": len(out),
@@ -449,7 +474,7 @@ def _thumb_frames(paths: list[Path]) -> list[bytes]:
         "-f", "rawvideo",
         "-",
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    result = _run_media(cmd, text=False)
     if result.returncode != 0:
         return []
 
@@ -590,8 +615,7 @@ def extract_keyframes(
     (:func:`dedupe_perceptual`, unless ``dedup`` is False); over-cap →
     even-sample first→last; too few keyframes → uniform fallback.
     """
-    if shutil.which("ffmpeg") is None:
-        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+    _require("ffmpeg")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for existing in out_dir.glob("frame_*.jpg"):
@@ -616,7 +640,7 @@ def extract_keyframes(
         "-q:v", "4",
         output_pattern,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run_media(cmd)
     if result.returncode != 0:
         raise SystemExit(f"ffmpeg keyframe extraction failed: {result.stderr.strip()}")
 

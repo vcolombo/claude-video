@@ -14,7 +14,15 @@ DEFAULT_DETAIL = "balanced"
 DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
 
 
-def read_env_file(path: Path | None = None) -> dict[str, str]:
+def parse_env_file(path: Path | None = None) -> dict[str, str]:
+    """Parse a ``.env`` file into a dict, tolerating quotes and inline comments.
+
+    This is the single source of truth for reading ``KEY=value`` lines — the
+    Whisper key loader and the setup preflight both route through it, so the
+    inline-comment handling below can't silently diverge between call sites
+    (a `GROQ_API_KEY=sk-x  # note` line would otherwise break auth the same way
+    a trailing comment once broke WATCH_DETAIL).
+    """
     if path is None:
         path = CONFIG_FILE
     values: dict[str, str] = {}
@@ -43,6 +51,23 @@ def read_env_file(path: Path | None = None) -> dict[str, str]:
                     break
         values[key.strip()] = value
     return values
+
+
+# Back-compat alias: existing callers import read_env_file.
+read_env_file = parse_env_file
+
+
+def env_value(name: str, path: Path | None = None) -> str | None:
+    """Return a config value, preferring the process environment over the file.
+
+    Env vars win over the ``.env`` file so an operator can override per-run
+    without editing config. Empty/whitespace values are treated as unset.
+    """
+    raw = os.environ.get(name)
+    if raw and raw.strip():
+        return raw.strip()
+    value = parse_env_file(path).get(name)
+    return value or None
 
 
 def get_config() -> dict[str, object]:
