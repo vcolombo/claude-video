@@ -147,6 +147,7 @@ def test_watch_ytdlp_proxy_falls_back_to_watch_config_file(monkeypatch, tmp_path
 
 def test_watch_ytdlp_proxy_is_omitted_when_unset(monkeypatch, tmp_path):
     monkeypatch.delenv("WATCH_YTDLP_PROXY", raising=False)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "missing.env")
     calls = _capture_argv(monkeypatch)
     download.fetch_captions(URL, tmp_path / "cap")
     with pytest.raises(SystemExit):

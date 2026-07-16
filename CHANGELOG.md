@@ -2,6 +2,11 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.3.3] — 2026-07-16
+
+### Fixed
+- Isolated the no-proxy regression test from the operator's real `~/.config/watch/.env`, so the suite stays deterministic when `WATCH_YTDLP_PROXY` is configured locally.
+
 ## [0.3.2] — 2026-07-16
 
 ### Added

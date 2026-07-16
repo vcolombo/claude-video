@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.3.2"
+version: "0.3.3"
 description: Give the agent a video input. Downloads a URL (YouTube, Vimeo, TikTok, X, Twitch, and most yt-dlp sites) or a local file with yt-dlp, extracts auto-scaled frames with ffmpeg, and pulls a timestamped transcript from native captions (Whisper API fallback), so the agent can answer questions about what's in the video. Use this whenever the user pastes a video URL or points at a local video file and asks anything about its contents, or types /watch — even if they don't say the word "watch".
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
