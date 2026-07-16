@@ -1,0 +1,42 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # ffmpeg/ffprobe synthesize the test clips and drive frame/audio extraction;
+      # yt-dlp must be on PATH because download.py gates on `shutil.which("yt-dlp")`
+      # before building argv (the tests stub subprocess, not the which() check).
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python deps
+        run: python -m pip install --upgrade pip pytest yt-dlp
+
+      - name: Verify tools
+        run: |
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+          yt-dlp --version
+
+      - name: Run tests
+        run: python -m pytest -q
