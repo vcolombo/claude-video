@@ -100,19 +100,24 @@ def _kill(proc: subprocess.Popen) -> None:
         pass
 
 
-def _run_scene_ffmpeg(
+def _run_ffmpeg_watched(
     cmd: list[str], out_dir: Path,
     timeout: int = FFMPEG_TIMEOUT, max_bytes: int = SCENE_MAX_BYTES,
+    label: str = "frame extraction",
 ) -> tuple[int, str]:
-    """Run the scene-detect ffmpeg pass under a transient-disk watchdog.
+    """Run a candidate-emitting ffmpeg pass under a transient-disk watchdog.
 
-    Returns ``(returncode, stderr_text)``. stderr carries the ``showinfo``
-    ``pts_time`` lines the caller parses, so it is redirected to a temp log file
-    (not a PIPE, which could deadlock the poll loop when the buffer fills on a
-    cut-heavy video). Polls :func:`_frames_bytes` each second and, on a size or
-    time breach, kills ffmpeg, deletes the partial ``frame_*.jpg`` output, and
-    raises ``SystemExit`` — the tail is never silently dropped; the run aborts
-    with guidance instead.
+    Shared by the scene-detect and keyframe engines — both write ``frame_*.jpg``
+    and emit ``showinfo`` ``pts_time`` lines to stderr. Without ``-frames:v`` (so
+    the tail is never silently dropped) an I-frame-per-frame or cut-heavy input
+    would materialize the whole stream before the downstream cap runs, so this
+    bounds it directly. ``label`` names the engine in abort messages.
+
+    Returns ``(returncode, stderr_text)``. stderr is redirected to a temp log file
+    (not a PIPE, which could deadlock the poll loop when the buffer fills). Polls
+    :func:`_frames_bytes` each second and, on a size or time breach, kills ffmpeg,
+    deletes the partial ``frame_*.jpg`` output, and raises ``SystemExit`` — the
+    run aborts with guidance instead of exhausting disk/RAM.
     """
     log = out_dir / "_scene.log"
 
@@ -137,13 +142,13 @@ def _run_scene_ffmpeg(
         """Return an abort reason if the frames or the stderr log breach their cap."""
         if _frames_bytes(out_dir) > max_bytes:
             return (
-                f"scene detection exceeded the {max_bytes // (1024 * 1024)} MiB "
+                f"{label} exceeded the {max_bytes // (1024 * 1024)} MiB "
                 "transient-frame cap (cut-heavy, oversized, or hostile input). "
                 "Use --start/--end to grab a section, or a lower --detail."
             )
         if _log_bytes() > SCENE_LOG_MAX:
             return (
-                f"scene detection produced over {SCENE_LOG_MAX // (1024 * 1024)} MiB "
+                f"{label} produced over {SCENE_LOG_MAX // (1024 * 1024)} MiB "
                 "of ffmpeg diagnostics (corrupt or hostile input). Use --start/--end, "
                 "or a lower --detail."
             )
@@ -163,7 +168,7 @@ def _run_scene_ffmpeg(
                     _kill(proc)
                     _cleanup()
                     raise SystemExit(
-                        f"ffmpeg scene detection timed out after {timeout}s "
+                        f"ffmpeg {label} timed out after {timeout}s "
                         "(possibly a corrupt or stalled input)."
                     )
                 reason = _over_cap()
@@ -380,7 +385,7 @@ def extract_scene_candidates(
     has emitted that many frames (early exit) and avoids writing extras that we
     would only delete afterwards. ``None`` (uncapped "complete" detail) keeps
     every detected shot, as the user explicitly opted in — bounded not by a frame
-    prefix (which would drop the tail) but by the :func:`_run_scene_ffmpeg`
+    prefix (which would drop the tail) but by the :func:`_run_ffmpeg_watched`
     transient-disk watchdog, which aborts if the candidate JPEGs exceed
     ``SCENE_MAX_BYTES``.
     """
@@ -414,7 +419,7 @@ def extract_scene_candidates(
         "-q:v", "4",
         output_pattern,
     ]
-    returncode, stderr = _run_scene_ffmpeg(cmd, out_dir)
+    returncode, stderr = _run_ffmpeg_watched(cmd, out_dir, label="scene detection")
     if returncode != 0:
         raise SystemExit(f"ffmpeg scene extraction failed: {stderr.strip()[-500:]}")
 
@@ -768,12 +773,15 @@ def extract_keyframes(
         "-q:v", "4",
         output_pattern,
     ]
-    result = _run_media(cmd)
-    if result.returncode != 0:
-        raise SystemExit(f"ffmpeg keyframe extraction failed: {result.stderr.strip()}")
+    # An all-I-frame video makes -skip_frame nokey decode every frame, so this
+    # runs under the same transient-disk watchdog as scene detection rather than
+    # materializing the whole stream before the max_frames cap thins it.
+    returncode, stderr = _run_ffmpeg_watched(cmd, out_dir, label="keyframe extraction")
+    if returncode != 0:
+        raise SystemExit(f"ffmpeg keyframe extraction failed: {stderr.strip()[-500:]}")
 
     offset = start_seconds or 0.0
-    timestamps = [round(offset + float(m.group(1)), 2) for m in SHOWINFO_TS_RE.finditer(result.stderr)]
+    timestamps = [round(offset + float(m.group(1)), 2) for m in SHOWINFO_TS_RE.finditer(stderr)]
     files = sorted(out_dir.glob("frame_*.jpg"))
     candidates: list[dict] = []
     for i, path in enumerate(files):

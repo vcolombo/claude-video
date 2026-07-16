@@ -132,7 +132,7 @@ def test_scene_ffmpeg_aborts_and_cleans_up_over_quota(tmp_path: Path):
     )
     import pytest
     with pytest.raises(SystemExit) as exc:
-        frames._run_scene_ffmpeg([sys.executable, "-c", writer], wd, timeout=60, max_bytes=4 * 1024 * 1024)
+        frames._run_ffmpeg_watched([sys.executable, "-c", writer], wd, timeout=60, max_bytes=4 * 1024 * 1024)
     assert "transient-frame cap" in str(exc.value)
     assert list(wd.glob("frame_*.jpg")) == []      # partial output cleaned
     assert not (wd / "_scene.log").exists()          # log cleaned
@@ -148,7 +148,7 @@ def test_scene_ffmpeg_returns_stderr_on_clean_finish(tmp_path: Path):
         "    open(f'{d}/frame_%04d.jpg'%i,'wb').write(b'y'*10)\n"
         "    sys.stderr.write('pts_time:%d.5\\n'%i)\n"
     )
-    rc, err = frames._run_scene_ffmpeg([sys.executable, "-c", writer], wd, timeout=30, max_bytes=10 ** 7)
+    rc, err = frames._run_ffmpeg_watched([sys.executable, "-c", writer], wd, timeout=30, max_bytes=10 ** 7)
     assert rc == 0
     assert "pts_time:0.5" in err and "pts_time:1.5" in err   # showinfo captured for parsing
     assert len(list(wd.glob("frame_*.jpg"))) == 2
@@ -159,7 +159,7 @@ def test_scene_ffmpeg_times_out(tmp_path: Path):
     wd.mkdir()
     import pytest
     with pytest.raises(SystemExit) as exc:
-        frames._run_scene_ffmpeg([sys.executable, "-c", "import time; time.sleep(30)"], wd, timeout=2, max_bytes=10 ** 9)
+        frames._run_ffmpeg_watched([sys.executable, "-c", "import time; time.sleep(30)"], wd, timeout=2, max_bytes=10 ** 9)
     assert "timed out" in str(exc.value)
 
 
@@ -177,7 +177,7 @@ def test_scene_ffmpeg_catches_fast_finishing_over_quota(tmp_path: Path):
     )
     import pytest
     with pytest.raises(SystemExit) as exc:
-        frames._run_scene_ffmpeg([sys.executable, "-c", writer], wd, timeout=30, max_bytes=4 * 1024 * 1024)
+        frames._run_ffmpeg_watched([sys.executable, "-c", writer], wd, timeout=30, max_bytes=4 * 1024 * 1024)
     assert "transient-frame cap" in str(exc.value)
     assert list(wd.glob("frame_*.jpg")) == []
 
@@ -191,6 +191,6 @@ def test_scene_ffmpeg_bounds_stderr_log(tmp_path: Path, monkeypatch):
     spam = "import sys\nsys.stderr.write('x'*(3*1024*1024)); sys.stderr.flush()\n"
     import pytest
     with pytest.raises(SystemExit) as exc:
-        frames._run_scene_ffmpeg([sys.executable, "-c", spam], wd, timeout=30, max_bytes=10 ** 9)
+        frames._run_ffmpeg_watched([sys.executable, "-c", spam], wd, timeout=30, max_bytes=10 ** 9)
     assert "diagnostics" in str(exc.value)
     assert not (wd / "_scene.log").exists()
