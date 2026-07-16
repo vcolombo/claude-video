@@ -36,6 +36,15 @@ OPENAI_MODEL = "whisper-1"
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 
+# Hard ceiling on the audio we will extract and bill for. At 64 kbps mono
+# (~480 kB/min) 128 MiB is ~4.5h of audio. A long low-bitrate remote video
+# within the 4 GiB download cap, or any large local file, would otherwise
+# extract a huge mp3 and fire off arbitrarily many billable upload requests. Past
+# this the run aborts with guidance to narrow via --start/--end. MAX_CHUNKS is a
+# defense-in-depth backstop on the upload count even if the byte math is off.
+MAX_TRANSCRIBE_BYTES = 128 * 1024 * 1024
+MAX_CHUNKS = 24
+
 
 def plan_chunks(
     total_seconds: float,
@@ -83,8 +92,18 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
     return None, None
 
 
-def extract_audio(video_path: str, out_path: Path) -> Path:
-    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
+def extract_audio(
+    video_path: str,
+    out_path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> Path:
+    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit.
+
+    When a focus range is given, only ``[start, end]`` is extracted so we never
+    transcode-and-bill the whole video just to keep a slice. ``-ss`` before ``-i``
+    is an input seek; ``-t`` bounds the output to the window duration.
+    """
     _require("ffmpeg")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,7 +112,15 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
         "-hide_banner",
         "-loglevel", "error",
         "-y",
-        "-i", str(Path(video_path).resolve()),
+    ]
+    if start_seconds is not None:
+        cmd += ["-ss", f"{start_seconds:.3f}"]
+    cmd += ["-i", str(Path(video_path).resolve())]
+    if end_seconds is not None:
+        duration = end_seconds - (start_seconds or 0.0)
+        if duration > 0:
+            cmd += ["-t", f"{duration:.3f}"]
+    cmd += [
         "-vn",
         "-acodec", "libmp3lame",
         "-ar", "16000",
@@ -393,8 +420,16 @@ def transcribe_video(
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
 ) -> tuple[list[dict], str]:
     """Run the full flow: extract audio → upload → parse segments.
+
+    A focus range limits extraction to ``[start, end]`` so only that window is
+    transcoded and billed; the returned segment timestamps are shifted back to
+    absolute source seconds so ``filter_range`` and the report stay correct.
+    Extracted audio is hard-capped (:data:`MAX_TRANSCRIBE_BYTES`) before any
+    upload so a long or oversized input cannot run up unbounded API cost.
 
     Returns (segments, backend_used). Raises SystemExit on any failure.
     """
@@ -412,8 +447,22 @@ def transcribe_video(
         )
 
     print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
-    audio_path = extract_audio(video_path, audio_out)
+    audio_path = extract_audio(video_path, audio_out, start_seconds, end_seconds)
     audio_bytes = audio_path.stat().st_size
+
+    # Cost guard: refuse to upload more audio than the cap, deleting the mp3 so a
+    # hostile/oversized input leaves nothing behind. Narrowing with --start/--end
+    # extracts only that window and stays under the cap.
+    if audio_bytes > MAX_TRANSCRIBE_BYTES:
+        try:
+            audio_path.unlink()
+        except OSError:
+            pass
+        raise SystemExit(
+            f"audio for transcription is {audio_bytes // (1024 * 1024)} MB, over the "
+            f"{MAX_TRANSCRIBE_BYTES // (1024 * 1024)} MB cap. Use --start/--end to "
+            "transcribe a section, or rely on the video's own captions."
+        )
 
     def transcribe_one(path: Path) -> list[dict]:
         return _transcribe_file(backend, api_key, path)
@@ -427,6 +476,11 @@ def transcribe_video(
     else:
         duration = audio_duration(audio_path)
         plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES)
+        if len(plan) > MAX_CHUNKS:
+            raise SystemExit(
+                f"transcription would need {len(plan)} upload chunks, over the "
+                f"{MAX_CHUNKS}-chunk cap. Use --start/--end to transcribe a section."
+            )
         print(
             f"[watch] audio: {audio_bytes / (1024 * 1024):.0f} MB exceeds "
             f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB — splitting into {len(plan)} chunks…",
@@ -437,6 +491,10 @@ def transcribe_video(
 
     if not segments:
         raise SystemExit("Whisper returned no transcript segments")
+
+    # Segments are 0-based within the extracted window; shift to absolute source
+    # time so downstream range-filtering and report timestamps line up.
+    segments = shift_segments(segments, start_seconds or 0.0)
 
     print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
     return segments, backend

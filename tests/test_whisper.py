@@ -161,6 +161,80 @@ class TestTranscribeChunks:
             whisper.transcribe_chunks(chunks, always_fail)
 
 
+class TestExtractAudioRange:
+    """Codex finding: a focus range must limit extraction, not transcode the
+    whole video and trim afterwards."""
+
+    def _stub_ffmpeg(self, monkeypatch, out_path: Path):
+        argv: list[list[str]] = []
+
+        class _Result:
+            returncode = 0
+            stderr = ""
+
+        def fake_run(cmd, *a, **k):
+            argv.append(list(cmd))
+            out_path.write_bytes(b"mp3")  # non-empty so the size check passes
+            return _Result()
+
+        monkeypatch.setattr(whisper, "_run_media", fake_run)
+        monkeypatch.setattr(whisper, "_require", lambda *_: None)
+        return argv
+
+    def test_range_seeks_and_bounds_duration(self, monkeypatch, tmp_path):
+        out = tmp_path / "audio.mp3"
+        argv = self._stub_ffmpeg(monkeypatch, out)
+        whisper.extract_audio("v.mp4", out, start_seconds=100.0, end_seconds=160.0)
+        cmd = argv[0]
+        assert "-ss" in cmd and cmd[cmd.index("-ss") + 1] == "100.000"
+        assert "-t" in cmd and cmd[cmd.index("-t") + 1] == "60.000"  # end - start
+        # -ss must precede -i (input seek), not follow it.
+        assert cmd.index("-ss") < cmd.index("-i")
+
+    def test_no_range_is_full_extraction(self, monkeypatch, tmp_path):
+        out = tmp_path / "audio.mp3"
+        argv = self._stub_ffmpeg(monkeypatch, out)
+        whisper.extract_audio("v.mp4", out)
+        cmd = argv[0]
+        assert "-ss" not in cmd and "-t" not in cmd
+
+
+class TestTranscribeVideoCostGuard:
+    """Codex finding: unbounded audio/upload cost when captions are absent."""
+
+    def _stub(self, monkeypatch, audio_bytes: int, tmp_path: Path):
+        audio = tmp_path / "audio.mp3"
+
+        def fake_extract(video, out_path, start=None, end=None):
+            out_path.write_bytes(b"x" * audio_bytes)
+            return out_path
+
+        monkeypatch.setattr(whisper, "extract_audio", fake_extract)
+        return audio
+
+    def test_aborts_and_deletes_over_byte_cap(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(whisper, "MAX_TRANSCRIBE_BYTES", 100)
+        audio = self._stub(monkeypatch, 500, tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            whisper.transcribe_video("v.mp4", audio, backend="groq", api_key="k")
+        assert "cap" in str(exc.value)
+        assert not audio.exists()  # oversized mp3 cleaned up, nothing uploaded
+
+    def test_shifts_segments_to_absolute_time(self, monkeypatch, tmp_path):
+        # Windowed extraction returns 0-based segments; the window offset must be
+        # added back so filter_range and the report use source time.
+        audio = self._stub(monkeypatch, 10, tmp_path)
+        monkeypatch.setattr(
+            whisper, "_transcribe_file",
+            lambda backend, key, path: [{"start": 0.0, "end": 2.0, "text": "hi"}],
+        )
+        segs, _ = whisper.transcribe_video(
+            "v.mp4", audio, backend="groq", api_key="k",
+            start_seconds=100.0, end_seconds=160.0,
+        )
+        assert segs == [{"start": 100.0, "end": 102.0, "text": "hi"}]
+
+
 class TestLoadApiKey:
     def _no_env(self, monkeypatch):
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
