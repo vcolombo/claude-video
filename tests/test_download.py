@@ -20,6 +20,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scr
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import download  # noqa: E402
+import config  # type: ignore[import-not-found]  # noqa: E402
 
 URL = "https://www.youtube.com/watch?v=rlOpbu3Enkw"
 
@@ -104,6 +105,55 @@ def test_all_ytdlp_invocations_ignore_config(monkeypatch, tmp_path):
     assert calls, "expected yt-dlp invocations"
     for argv in calls:
         assert "--ignore-config" in argv, f"missing --ignore-config in {argv}"
+
+
+def test_watch_ytdlp_proxy_is_applied_to_every_invocation(monkeypatch, tmp_path):
+    proxy = "http://ts-exitproxy:1056"
+    monkeypatch.setenv("WATCH_YTDLP_PROXY", proxy)
+    calls = _capture_argv(monkeypatch)
+    download.fetch_captions(URL, tmp_path / "cap")
+    with pytest.raises(SystemExit):
+        download.download_url(URL, tmp_path / "dl")
+    assert calls, "expected yt-dlp invocations"
+    for argv in calls:
+        index = argv.index("--proxy")
+        assert argv[index + 1] == proxy
+
+
+def test_watch_ytdlp_proxy_is_applied_to_native_language_fallback(monkeypatch, tmp_path):
+    proxy = "socks5://ts-exitproxy:1055"
+    monkeypatch.setenv("WATCH_YTDLP_PROXY", proxy)
+    calls = _capture_argv(monkeypatch)
+    monkeypatch.setattr(download, "_read_info", lambda *args: {"language": "fr"})
+    monkeypatch.setattr(download, "_pick_subtitle", lambda *args: None)
+    download.fetch_captions(URL, tmp_path / "cap")
+    assert len(calls) == 2, "expected primary and native-language caption fetches"
+    for argv in calls:
+        index = argv.index("--proxy")
+        assert argv[index + 1] == proxy
+
+
+def test_watch_ytdlp_proxy_falls_back_to_watch_config_file(monkeypatch, tmp_path):
+    proxy = "http://ts-exitproxy:1056"
+    config_file = tmp_path / ".env"
+    config_file.write_text(f"WATCH_YTDLP_PROXY={proxy}\n", encoding="utf-8")
+    monkeypatch.delenv("WATCH_YTDLP_PROXY", raising=False)
+    monkeypatch.setattr(config, "CONFIG_FILE", config_file)
+    calls = _capture_argv(monkeypatch)
+    download.fetch_captions(URL, tmp_path / "cap")
+    index = calls[0].index("--proxy")
+    assert calls[0][index + 1] == proxy
+
+
+def test_watch_ytdlp_proxy_is_omitted_when_unset(monkeypatch, tmp_path):
+    monkeypatch.delenv("WATCH_YTDLP_PROXY", raising=False)
+    calls = _capture_argv(monkeypatch)
+    download.fetch_captions(URL, tmp_path / "cap")
+    with pytest.raises(SystemExit):
+        download.download_url(URL, tmp_path / "dl")
+    assert calls, "expected yt-dlp invocations"
+    for argv in calls:
+        assert "--proxy" not in argv
 
 
 # --- SSRF guard -----------------------------------------------------------

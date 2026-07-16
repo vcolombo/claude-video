@@ -56,6 +56,10 @@ OPENAI_API_KEY=
 # Allowed values: transcript | efficient | balanced | token-burner
 # Keep the value on its own line with no trailing comment.
 # WATCH_DETAIL=balanced
+
+# Optional yt-dlp-only proxy for hosts whose direct egress is blocked.
+# Examples: http://proxy:1056 | socks5://proxy:1055
+# WATCH_YTDLP_PROXY=
 """
 
 

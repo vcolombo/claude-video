@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from config import env_value
+
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 
@@ -39,6 +41,11 @@ MAX_INFO_BYTES = 4 * 1024 * 1024  # 4 MiB
 # yt-dlp reads config (yt-dlp.conf) from the CWD and other locations, and config
 # can carry --exec → arbitrary command execution. Run hermetically everywhere.
 IGNORE_CONFIG = ["--ignore-config"]
+
+
+def _proxy_args() -> list[str]:
+    proxy = env_value("WATCH_YTDLP_PROXY")
+    return ["--proxy", proxy] if proxy else []
 
 
 def is_url(source: str) -> bool:
@@ -273,6 +280,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
     cmd = [
         "yt-dlp",
         *IGNORE_CONFIG,
+        *_proxy_args(),
         "--skip-download",
         "--write-info-json",
         *_sub_args(),
@@ -304,7 +312,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
     if subtitle is None and lang and not str(lang).lower().startswith("en"):
         _run_ytdlp_watched(
             [
-                "yt-dlp", *IGNORE_CONFIG, "--skip-download",
+                "yt-dlp", *IGNORE_CONFIG, *_proxy_args(), "--skip-download",
                 *_sub_args(f"{lang}.*,-live_chat"),
                 "--no-playlist", "--ignore-errors",
                 "-o", output_template, "--", url,
@@ -363,6 +371,7 @@ def download_url(
     cmd = [
         "yt-dlp",
         *IGNORE_CONFIG,
+        *_proxy_args(),
         "-N", "8",
         "-f", fmt,
         "--merge-output-format", "mp4",

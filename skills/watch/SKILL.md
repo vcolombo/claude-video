@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.3.1"
+version: "0.3.2"
 description: Give the agent a video input. Downloads a URL (YouTube, Vimeo, TikTok, X, Twitch, and most yt-dlp sites) or a local file with yt-dlp, extracts auto-scaled frames with ffmpeg, and pulls a timestamped transcript from native captions (Whisper API fallback), so the agent can answer questions about what's in the video. Use this whenever the user pastes a video URL or points at a local video file and asks anything about its contents, or types /watch — even if they don't say the word "watch".
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -100,6 +100,14 @@ WATCH_DETAIL=balanced
 ```
 
 Use the user's selected value. If they skip the question, keep the recommended default. Once dependencies, the API-key choice, and this preference are handled, write or update `SETUP_COMPLETE=true` in the same file. Do not ask this preference question again when `SETUP_COMPLETE=true`.
+
+**Optional yt-dlp proxy:** when the host's direct egress is blocked or rate-limited but the operator provides a trusted HTTP/SOCKS proxy, set it in the same file (or the process environment):
+
+```bash
+WATCH_YTDLP_PROXY=http://proxy-host:1056
+```
+
+Only yt-dlp receives this setting. It does not proxy Whisper API calls, local-file processing, or the surrounding agent process. Process environment wins over the file for one-off overrides. Prefer an unauthenticated private-network relay or environment-based secret injection: authenticated proxy URLs are passed in process argv and may be visible to other processes owned by the same OS user.
 
 **Structured mode (optional):** `python3 "${SKILL_DIR}/scripts/setup.py" --json` emits `{status, can_proceed, first_run, setup_complete, missing_binaries, whisper_backend, has_api_key, config_file, watch_detail, platform}` where `status` is one of `ready | needs_install | needs_key | needs_install_and_key`. `status` describes the *ideal* state (a key is encouraged, so a keyless first run reads `needs_key`); `can_proceed` is the operational gate (binaries present AND a key is set OR setup was already completed). Branch on `can_proceed`/`first_run` to decide whether to run; use `status` to decide what to encourage.
 
@@ -235,6 +243,7 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
+- **Direct VPS egress triggers a bot/IP challenge** → if the operator has a trusted outbound proxy or home-exit relay, set `WATCH_YTDLP_PROXY` and retry once. Do not substitute random public proxies.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
 
 ## Token efficiency
@@ -249,7 +258,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 ## Security & Permissions
 
 **What this skill does:**
-- Runs `yt-dlp` locally (always with `--ignore-config`, so a `yt-dlp.conf` in the working directory can't inject flags or `--exec`) to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at). URLs that resolve to a non-public address (loopback, RFC1918, link-local/metadata `169.254.169.254`, CGNAT, reserved) are **refused before yt-dlp runs** (best-effort SSRF guard); live streams are rejected, each download is time-bounded, per-file size-capped, and aborted by a watchdog if the total on-disk size exceeds an aggregate ceiling. English captions are preferred, with a fallback to the video's native-language subtitles
+- Runs `yt-dlp` locally (always with `--ignore-config`, so a `yt-dlp.conf` in the working directory can't inject flags or `--exec`) to download the video and pull native captions when the source supports them. Requests go directly to the source host unless the operator explicitly configures `WATCH_YTDLP_PROXY`; that value is passed only to yt-dlp as a separate argv value. URLs that resolve to a non-public address (loopback, RFC1918, link-local/metadata `169.254.169.254`, CGNAT, reserved) are **refused before yt-dlp runs** (best-effort SSRF guard); live streams are rejected, each download is time-bounded, per-file size-capped, and aborted by a watchdog if the total on-disk size exceeds an aggregate ceiling. English captions are preferred, with a fallback to the video's native-language subtitles
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip. Scene detection spans the whole video (the tail is never silently dropped) but its transient candidate JPEGs are bounded by a disk watchdog that aborts a cut-heavy or hostile input before it fills the disk. Fetched captions are parsed with a bounded read and cue-count ceiling, so an oversized/hostile subtitle response can't balloon memory
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced

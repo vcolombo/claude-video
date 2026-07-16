@@ -1,6 +1,6 @@
 {
   "name": "watch",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Give the agent a video input. Downloads a URL (YouTube, Vimeo, TikTok, X, Twitch, and most yt-dlp sites) or a local file with yt-dlp, extracts auto-scaled frames with ffmpeg, and pulls a timestamped transcript from native captions (Whisper API fallback), so the agent can answer questions about what's in the video.",
   "author": {
     "name": "Bradley Bonanno"

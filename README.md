@@ -43,7 +43,7 @@ With Claude Video `/watch` you can paste a URL or a local path, ask a question, 
 ## How it works
 
 1. **You paste a video and a question.** URL (anything yt-dlp supports — YouTube, Loom, TikTok, X, Instagram, plus a few hundred more) or a local path (`.mp4`, `.mov`, `.mkv`, `.webm`).
-2. **`yt-dlp` checks captions first.** At `transcript` detail, captioned URLs return without downloading video. Otherwise, or when Whisper needs audio, it downloads only what the run needs. Input URLs are treated as untrusted: yt-dlp runs with `--ignore-config` (a workspace `yt-dlp.conf` can't inject flags), URLs resolving to non-public addresses are refused before yt-dlp runs (best-effort SSRF guard — see SKILL.md for its limits), live streams are rejected, and downloads are time-bounded, per-file size-capped, and watchdog-aborted past an aggregate disk ceiling. English captions are preferred, with a fallback to the video's own native-language subtitles.
+2. **`yt-dlp` checks captions first.** At `transcript` detail, captioned URLs return without downloading video. Otherwise, or when Whisper needs audio, it downloads only what the run needs. Input URLs are treated as untrusted: yt-dlp runs with `--ignore-config` (a workspace `yt-dlp.conf` can't inject flags), URLs resolving to non-public addresses are refused before yt-dlp runs (best-effort SSRF guard — see SKILL.md for its limits), live streams are rejected, and downloads are time-bounded, per-file size-capped, and watchdog-aborted past an aggregate disk ceiling. Hosts with blocked direct egress can set a trusted yt-dlp-only proxy via `WATCH_YTDLP_PROXY`.
 3. **`ffmpeg` extracts frames at the chosen detail.** `efficient` decodes keyframes only (near-instant); `balanced`/`token-burner` prefer scene-change frames and fall back to the duration-aware uniform sampler when they under-produce. JPEGs are 512px wide by default and clamped to 1998px tall for Claude Read compatibility.
 4. **The transcript comes from one of two places.** First try: `yt-dlp` pulls native captions (manual or auto-generated) from the source. Free, instant, accurate-ish. Fallback: extract a mono 16 kHz 64 kbps mp3 audio clip (~480 kB/min) and ship it to Whisper — Groq's `whisper-large-v3` (preferred — cheaper and faster) or OpenAI's `whisper-1`.
 5. **Frames + transcript are handed to Claude.** The script prints frame paths with `t=MM:SS` markers and the transcript with timestamps. Claude `Read`s each frame in parallel — JPEGs render directly as images in its context.
@@ -158,6 +158,7 @@ On the first `/watch` call, the skill runs `scripts/setup.py --check`. If `ffmpe
 - **Linux** — prints the exact `apt` / `dnf` / `pipx` commands.
 - **Windows** — prints the `winget` / `pip` commands.
 - **API key** — scaffolds `~/.config/watch/.env` (mode `0600`) with commented placeholders for `GROQ_API_KEY` (preferred) and `OPENAI_API_KEY`.
+- **Optional proxy** — set `WATCH_YTDLP_PROXY=http://proxy-host:1056` (or a supported SOCKS URL) in the same file when yt-dlp must use a trusted outbound relay. Only yt-dlp receives it. Prefer an unauthenticated private-network relay or environment-based secret injection: authenticated proxy URLs are passed in process argv and may be visible to other processes owned by the same OS user.
 
 After setup, preflight is silent and `/watch` just works. The check is a sub-100ms lookup, so it doesn't slow you down on subsequent runs.
 
@@ -204,6 +205,7 @@ Other knobs (passed to `scripts/watch.py`):
 
 - **Long-video accuracy depends on the detail mode.** On the capped modes (`efficient`, default `balanced`) coverage thins out past ~10 minutes — the frame cap spreads across the whole clip, so the script prints a "sparse scan" warning and you're better off re-running focused with `--start`/`--end`. `token-burner` lifts the cap and keeps *every* scene-change frame across the full video, so it stays complete on longer clips at the cost of more image tokens. The 10-minute mark is guidance for the capped modes, not a hard ceiling.
 - **Detail is one dial.** Defaults are balanced: scene-aware frames, 2 fps max, 100-frame cap. Use `--detail efficient` for a fast 50-frame keyframe pass, or `--detail token-burner` for scene candidates up to a hard 500-frame ceiling. Set `WATCH_DETAIL` in `~/.config/watch/.env` to change the default.
+- **Blocked datacenter egress needs an operator-owned relay.** Set `WATCH_YTDLP_PROXY` to a trusted HTTP/SOCKS proxy; `/watch` never falls back to public proxy lists.
 
 ## Structure
 

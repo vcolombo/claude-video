@@ -2,6 +2,15 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.3.2] — 2026-07-16
+
+### Added
+- **Trusted yt-dlp-only proxy support.** Set `WATCH_YTDLP_PROXY` in `~/.config/watch/.env` or the process environment to route caption/media requests through an operator-owned HTTP/SOCKS relay while keeping Whisper and the surrounding agent on direct egress.
+- Regression coverage verifies the proxy is passed as a separate argv value to every yt-dlp invocation and omitted when unset.
+
+### Security
+- Proxy support preserves `--ignore-config`, the public-host SSRF preflight, process-group watchdogs, download caps, and argv separation. `/watch` never discovers or uses public proxy lists.
+
 ## [0.2.0] — 2026-06-29
 
 ### Added
