@@ -16,13 +16,28 @@ TS_RE = re.compile(
 )
 TAG_RE = re.compile(r"<[^>]+>")
 
+# A caption fetch is disk-capped (MAX_CAPTION_BYTES) but that whole file would
+# otherwise be read, split, deduped, and formatted in memory. A hostile response
+# near the disk cap could then balloon memory into hundreds of MiB. Bound what we
+# actually parse: hours of real captions are well under 1 MiB and a few thousand
+# cues, so these ceilings only ever trip on a crafted file.
+MAX_VTT_BYTES = 8 * 1024 * 1024   # 8 MiB of subtitle text
+MAX_CUES = 100_000                # parsed-cue ceiling
+
 
 def _to_seconds(h: str, m: str, s: str, ms: str) -> float:
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
 
 
 def parse_vtt(path: str) -> list[dict]:
-    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    with Path(path).open("r", encoding="utf-8", errors="ignore") as fh:
+        text = fh.read(MAX_VTT_BYTES)
+    if len(text) >= MAX_VTT_BYTES:
+        print(
+            f"[watch] caption file exceeds {MAX_VTT_BYTES // (1024 * 1024)} MiB — "
+            "parsing the leading portion only.",
+            file=sys.stderr,
+        )
     lines = text.splitlines()
 
     segments: list[dict] = []
@@ -47,6 +62,12 @@ def parse_vtt(path: str) -> list[dict]:
         cue_text = " ".join(cue_lines).strip()
         if cue_text:
             segments.append({"start": round(start, 2), "end": round(end, 2), "text": cue_text})
+            if len(segments) >= MAX_CUES:
+                print(
+                    f"[watch] caption cue count hit the {MAX_CUES} ceiling — truncating.",
+                    file=sys.stderr,
+                )
+                break
         i += 1
 
     return _dedupe(segments)

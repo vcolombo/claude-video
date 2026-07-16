@@ -165,6 +165,11 @@ def main() -> int:
         work = Path(tempfile.mkdtemp(prefix="watch-"))
     work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
+    # Unique per-run download subdir. The download watchdog rmtrees this dir on a
+    # timeout/quota breach, so a shared or reused --out-dir must not let one run's
+    # cleanup erase a concurrent run's files. mkdtemp is unique even when work is
+    # a caller-supplied, reused directory.
+    download_dir = Path(tempfile.mkdtemp(prefix="dl-", dir=work))
 
     url_source = is_url(args.source)
     dl: dict = {"subtitle_path": None, "info": {}, "downloaded": False}
@@ -175,7 +180,7 @@ def main() -> int:
 
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
-        dl = fetch_captions(args.source, work / "download")
+        dl = fetch_captions(args.source, download_dir)
         if dl.get("subtitle_path"):
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
@@ -207,12 +212,12 @@ def main() -> int:
             )
             dl = download(
                 args.source,
-                work / "download",
+                download_dir,
                 audio_only=audio_only,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)
-            dl = download(args.source, work / "download")
+            dl = download(args.source, download_dir)
         video_path = dl["video_path"]
 
     meta = get_metadata(video_path) if video_path else {

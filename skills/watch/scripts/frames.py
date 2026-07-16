@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -41,6 +42,13 @@ SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 # ffmpeg/ffprobe should never block indefinitely on a corrupt or truncated file.
 FFPROBE_TIMEOUT = 60
 FFMPEG_TIMEOUT = 900
+# Scene detection writes one JPEG per detected cut across the whole video (no
+# -frames:v prefix cap, so the tail is never silently dropped). A pathological or
+# hostile input — thousands of cuts, or an unbounded local file — could fill the
+# disk before the downstream frame cap runs. Bound the transient JPEGs with a
+# watchdog. 1 GiB of ~512px q4 frames is tens of thousands of shots: legit videos
+# never approach it, only strobing/adversarial ones do.
+SCENE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
 
 def _require(binary: str) -> None:
@@ -62,6 +70,92 @@ def _run_media(cmd: list[str], timeout: int = FFMPEG_TIMEOUT, text: bool = True)
         return subprocess.run(cmd, capture_output=True, text=text, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise SystemExit(f"{cmd[0]} timed out after {timeout}s (possibly a corrupt or stalled input)")
+
+
+def _frames_bytes(out_dir: Path) -> int:
+    """Total bytes of the ``frame_*.jpg`` scene candidates in ``out_dir``."""
+    total = 0
+    for p in out_dir.glob("frame_*.jpg"):
+        try:
+            total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    """Kill a single ffmpeg process (it spawns no children) and reap it."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _run_scene_ffmpeg(
+    cmd: list[str], out_dir: Path,
+    timeout: int = FFMPEG_TIMEOUT, max_bytes: int = SCENE_MAX_BYTES,
+) -> tuple[int, str]:
+    """Run the scene-detect ffmpeg pass under a transient-disk watchdog.
+
+    Returns ``(returncode, stderr_text)``. stderr carries the ``showinfo``
+    ``pts_time`` lines the caller parses, so it is redirected to a temp log file
+    (not a PIPE, which could deadlock the poll loop when the buffer fills on a
+    cut-heavy video). Polls :func:`_frames_bytes` each second and, on a size or
+    time breach, kills ffmpeg, deletes the partial ``frame_*.jpg`` output, and
+    raises ``SystemExit`` — the tail is never silently dropped; the run aborts
+    with guidance instead.
+    """
+    log = out_dir / "_scene.log"
+
+    def _cleanup() -> None:
+        for p in out_dir.glob("frame_*.jpg"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        try:
+            log.unlink()
+        except OSError:
+            pass
+
+    with open(log, "wb") as errf:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf)
+        start = time.monotonic()
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=1.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() - start > timeout:
+                    _kill(proc)
+                    _cleanup()
+                    raise SystemExit(
+                        f"ffmpeg scene detection timed out after {timeout}s "
+                        "(possibly a corrupt or stalled input)."
+                    )
+                if _frames_bytes(out_dir) > max_bytes:
+                    _kill(proc)
+                    _cleanup()
+                    raise SystemExit(
+                        f"scene detection exceeded the {max_bytes // (1024 * 1024)} MiB "
+                        "transient-frame cap (cut-heavy, oversized, or hostile input). "
+                        "Use --start/--end to grab a section, or a lower --detail."
+                    )
+        finally:
+            if proc.poll() is None:
+                _kill(proc)
+    stderr_text = log.read_text(encoding="utf-8", errors="replace")
+    try:
+        log.unlink()
+    except OSError:
+        pass
+    return proc.returncode, stderr_text
 
 
 def _scale_filter(resolution: int) -> str:
@@ -255,7 +349,10 @@ def extract_scene_candidates(
     When ``max_frames`` is set, ``-frames:v`` lets ffmpeg stop decoding once it
     has emitted that many frames (early exit) and avoids writing extras that we
     would only delete afterwards. ``None`` (uncapped "complete" detail) keeps
-    every detected shot, as the user explicitly opted in.
+    every detected shot, as the user explicitly opted in — bounded not by a frame
+    prefix (which would drop the tail) but by the :func:`_run_scene_ffmpeg`
+    transient-disk watchdog, which aborts if the candidate JPEGs exceed
+    ``SCENE_MAX_BYTES``.
     """
     _require("ffmpeg")
 
@@ -287,12 +384,12 @@ def extract_scene_candidates(
         "-q:v", "4",
         output_pattern,
     ]
-    result = _run_media(cmd)
-    if result.returncode != 0:
-        raise SystemExit(f"ffmpeg scene extraction failed: {result.stderr.strip()}")
+    returncode, stderr = _run_scene_ffmpeg(cmd, out_dir)
+    if returncode != 0:
+        raise SystemExit(f"ffmpeg scene extraction failed: {stderr.strip()[-500:]}")
 
     offset = start_seconds or 0.0
-    timestamps = [round(offset + float(match.group(1)), 2) for match in SHOWINFO_TS_RE.finditer(result.stderr)]
+    timestamps = [round(offset + float(match.group(1)), 2) for match in SHOWINFO_TS_RE.finditer(stderr)]
     frames = sorted(out_dir.glob("frame_*.jpg"))
     out: list[dict] = []
     for i, path in enumerate(frames):
