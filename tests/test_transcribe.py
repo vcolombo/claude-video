@@ -103,3 +103,33 @@ def test_format_transcript_stamps_minutes_seconds():
     ]
     out = transcribe.format_transcript(segs)
     assert out == "[00:05] early\n[02:05] later"
+
+
+# --- resource bounds (Codex round-3: hostile caption can balloon memory) -----
+
+def test_parse_vtt_bounds_bytes_read(tmp_path, monkeypatch):
+    # A caption file far larger than the read ceiling is only parsed up to that
+    # ceiling, so memory can't be driven into hundreds of MiB by a hostile source.
+    monkeypatch.setattr(transcribe, "MAX_VTT_BYTES", 4096)
+    buf = ["WEBVTT\n\n"]
+    total = len(buf[0])
+    i = 0
+    while total < 64 * 1024:  # 64 KiB file, 4 KiB read cap
+        block = f"00:00:{i % 60:02d}.000 --> 00:00:{(i + 1) % 60:02d}.000\nline {i}\n\n"
+        buf.append(block)
+        total += len(block)
+        i += 1
+    p = tmp_path / "video.en.vtt"
+    p.write_text("".join(buf), encoding="utf-8")
+    segs = transcribe.parse_vtt(str(p))
+    assert 0 < len(segs) < i  # only the leading portion parsed
+
+
+def test_parse_vtt_caps_cue_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(transcribe, "MAX_CUES", 10)
+    lines = ["WEBVTT\n\n"]
+    for j in range(200):
+        lines.append(f"00:00:{j % 60:02d}.000 --> 00:00:{(j + 1) % 60:02d}.000\nc{j}\n\n")
+    p = tmp_path / "video.en.vtt"
+    p.write_text("".join(lines), encoding="utf-8")
+    assert len(transcribe.parse_vtt(str(p))) <= 10

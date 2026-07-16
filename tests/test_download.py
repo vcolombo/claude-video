@@ -25,9 +25,9 @@ URL = "https://www.youtube.com/watch?v=rlOpbu3Enkw"
 
 
 def _capture_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Stub subprocess.run inside download.py and record every argv.
-
-    Also neutralizes the SSRF guard so argv construction can be inspected
+    """Stub both subprocess.run and subprocess.Popen inside download.py and record
+    every argv. download_url runs under the watchdog (Popen); fetch_captions uses
+    run. Also neutralizes the SSRF guard so argv construction can be inspected
     without real DNS (conftest promises no network)."""
     calls: list[list[str]] = []
 
@@ -36,11 +36,24 @@ def _capture_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         stdout = ""
         stderr = ""
 
+    class _FakePopen:
+        def __init__(self, cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            self.returncode = 0
+            self.pid = -1
+
+        def wait(self, timeout=None):  # already "finished" → watchdog breaks
+            return 0
+
+        def poll(self):
+            return 0
+
     def fake_run(cmd, *args, **kwargs):
         calls.append(list(cmd))
         return _Result()
 
     monkeypatch.setattr(download.subprocess, "run", fake_run)
+    monkeypatch.setattr(download.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(download, "reject_internal_url", lambda url: None)
     return calls
 
@@ -81,6 +94,18 @@ def test_download_url_caps_size_and_rejects_live(monkeypatch, tmp_path):
     assert "--match-filter" in argv and "!is_live" in argv, "download must reject live streams"
 
 
+def test_all_ytdlp_invocations_ignore_config(monkeypatch, tmp_path):
+    # Codex finding 1: --ignore-config must be present so a workspace yt-dlp.conf
+    # (which can carry --exec) cannot run when /watch is invoked from that repo.
+    calls = _capture_argv(monkeypatch)
+    download.fetch_captions(URL, tmp_path / "cap")
+    with pytest.raises(SystemExit):
+        download.download_url(URL, tmp_path / "dl")
+    assert calls, "expected yt-dlp invocations"
+    for argv in calls:
+        assert "--ignore-config" in argv, f"missing --ignore-config in {argv}"
+
+
 # --- SSRF guard -----------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -91,6 +116,9 @@ def test_download_url_caps_size_and_rejects_live(monkeypatch, tmp_path):
         "http://10.0.0.5/",             # RFC1918 private
         "http://192.168.1.1/admin",     # RFC1918 private
         "http://[::1]/",                # IPv6 loopback
+        "http://100.64.0.1/",           # CGNAT (caught by is_global, not is_private)
+        "http://0.0.0.0/",              # unspecified
+        "http://192.0.2.1/",            # TEST-NET-1 documentation range
     ],
 )
 def test_reject_internal_url_blocks_internal_hosts(url):
@@ -137,3 +165,65 @@ def test_fetch_captions_refuses_internal_before_running(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         download.fetch_captions("http://169.254.169.254/", tmp_path / "download")
     assert calls == [], "yt-dlp must not run for an internal URL"
+
+
+# --- aggregate disk watchdog (Codex finding 3) -----------------------------
+
+def test_dir_size_sums_files(tmp_path):
+    (tmp_path / "a").write_bytes(b"x" * 100)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b").write_bytes(b"y" * 50)
+    assert download._dir_size(tmp_path) == 150
+
+
+def test_watched_run_aborts_and_cleans_up_over_quota(tmp_path):
+    # A real subprocess (stdlib only, no ffmpeg/network) that writes past the cap.
+    wd = tmp_path / "dl"
+    wd.mkdir()
+    writer = (
+        "import time\n"
+        f"f=open(r'{wd / 'big.bin'}','wb')\n"
+        "\nfor _ in range(10000):\n"
+        "    f.write(b'x'*1048576); f.flush(); time.sleep(0.02)\n"
+    )
+    cmd = [sys.executable, "-c", writer]
+    with pytest.raises(SystemExit):
+        download._run_ytdlp_watched(cmd, timeout=60, watch_dir=wd, max_bytes=4 * 1024 * 1024)
+    # Partial download directory is removed on abort.
+    assert not wd.exists() or download._dir_size(wd) == 0
+
+
+def test_watched_run_returns_when_process_finishes(tmp_path):
+    wd = tmp_path / "dl"
+    wd.mkdir()
+    cmd = [sys.executable, "-c", "pass"]
+    result = download._run_ytdlp_watched(cmd, timeout=30, watch_dir=wd, max_bytes=10 * 1024 * 1024)
+    assert result.returncode == 0
+
+
+def test_watched_run_catches_fast_finishing_over_quota(tmp_path):
+    # Codex round-2 finding: a child that crosses the cap and exits inside the
+    # first poll interval must still be caught by the final post-loop check.
+    wd = tmp_path / "dl"
+    wd.mkdir()
+    cmd = [sys.executable, "-c", f"open(r'{wd / 'big.bin'}','wb').write(b'x' * (8 * 1024 * 1024))"]
+    with pytest.raises(SystemExit):
+        download._run_ytdlp_watched(cmd, timeout=30, watch_dir=wd, max_bytes=4 * 1024 * 1024)
+    assert not wd.exists() or download._dir_size(wd) == 0
+
+
+# --- metadata / info.json memory bound (Codex round-5) -----------------------
+
+def test_read_info_ignores_oversized_json(tmp_path):
+    p = tmp_path / "video.info.json"
+    p.write_text('{"title":"t","pad":"' + "a" * (5 * 1024 * 1024) + '"}', encoding="utf-8")
+    # Over MAX_INFO_BYTES: parsed metadata is discarded, only the URL is kept, so a
+    # hostile extractor response can't balloon memory via json.loads.
+    assert download._read_info(p, "https://host/v") == {"url": "https://host/v"}
+
+
+def test_read_info_parses_small_json(tmp_path):
+    p = tmp_path / "video.info.json"
+    p.write_text('{"title":"Real","webpage_url":"https://host/v"}', encoding="utf-8")
+    assert download._read_info(p, "https://host/v")["title"] == "Real"

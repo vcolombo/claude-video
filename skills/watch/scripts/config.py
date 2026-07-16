@@ -14,14 +14,42 @@ DEFAULT_DETAIL = "balanced"
 DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
 
 
+def _parse_value(raw: str) -> str:
+    """Parse the right-hand side of a ``KEY=value`` line, quote-aware.
+
+    Comment detection and unquoting are done in one pass so they compose (an
+    earlier version stripped comments and unquoted independently, which left
+    quotes on ``'sk-x'  # note`` and turned ``KEY=  # optional`` into the
+    non-empty value ``# optional`` — a false-ready API key). Rules:
+      1. empty, or the value begins with '#'  → "" (the whole RHS is a comment)
+      2. begins with a quote → content up to the matching closing quote
+         (any trailing inline comment is ignored)
+      3. otherwise → cut at the first whitespace-preceded '#', then rstrip
+         (so an embedded '#' with no leading space stays part of the value)
+    """
+    s = raw.strip()
+    if not s or s[0] == "#":
+        return ""
+    if s[0] in ('"', "'"):
+        close = s.find(s[0], 1)
+        if close != -1:
+            return s[1:close]
+        # Unterminated quote — fall through and treat as unquoted text.
+    out: list[str] = []
+    for i, ch in enumerate(s):
+        if ch == "#" and i > 0 and s[i - 1] in " \t":
+            break
+        out.append(ch)
+    return "".join(out).rstrip()
+
+
 def parse_env_file(path: Path | None = None) -> dict[str, str]:
     """Parse a ``.env`` file into a dict, tolerating quotes and inline comments.
 
     This is the single source of truth for reading ``KEY=value`` lines — the
     Whisper key loader and the setup preflight both route through it, so the
-    inline-comment handling below can't silently diverge between call sites
-    (a `GROQ_API_KEY=sk-x  # note` line would otherwise break auth the same way
-    a trailing comment once broke WATCH_DETAIL).
+    value parsing (see :func:`_parse_value`) can't silently diverge between
+    call sites.
     """
     if path is None:
         path = CONFIG_FILE
@@ -37,19 +65,7 @@ def parse_env_file(path: Path | None = None) -> dict[str, str]:
         if not raw or raw.startswith("#") or "=" not in raw:
             continue
         key, _, value = raw.partition("=")
-        value = value.strip()
-        if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
-            value = value[1:-1]
-        else:
-            # Strip an inline comment (a '#' preceded by whitespace) from an
-            # unquoted value. Without this, `WATCH_DETAIL=balanced  # note`
-            # parses as "balanced  # note", fails validation, and silently
-            # falls back to the default. Keeps '#' inside quotes / API keys.
-            for i, ch in enumerate(value):
-                if ch == "#" and i > 0 and value[i - 1] in " \t":
-                    value = value[:i].rstrip()
-                    break
-        values[key.strip()] = value
+        values[key.strip()] = _parse_value(value)
     return values
 
 

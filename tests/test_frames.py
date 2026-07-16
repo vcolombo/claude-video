@@ -111,3 +111,86 @@ def test_auto_fps_focus_is_denser_than_full():
 def test_get_metadata_reports_has_video(cut_clip: Path):
     meta = frames.get_metadata(str(cut_clip))
     assert meta["has_video"] is True
+
+
+# --- scene-extraction disk watchdog (Codex round-3) --------------------------
+# Real subprocess, stdlib only (no ffmpeg): a python writer stands in for the
+# scene-detect ffmpeg pass so the watchdog's kill/cleanup path is exercised in CI.
+import sys  # noqa: E402
+
+
+def test_scene_ffmpeg_aborts_and_cleans_up_over_quota(tmp_path: Path):
+    wd = tmp_path / "scene"
+    wd.mkdir()
+    writer = (
+        "import time,sys\n"
+        f"d=r'{wd}'\n"
+        "for i in range(10000):\n"
+        "    open(f'{d}/frame_%04d.jpg'%i,'wb').write(b'x'*1048576)\n"
+        "    sys.stderr.write('pts_time:%d.0\\n'%i); sys.stderr.flush()\n"
+        "    time.sleep(0.02)\n"
+    )
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        frames._run_scene_ffmpeg([sys.executable, "-c", writer], wd, timeout=60, max_bytes=4 * 1024 * 1024)
+    assert "transient-frame cap" in str(exc.value)
+    assert list(wd.glob("frame_*.jpg")) == []      # partial output cleaned
+    assert not (wd / "_scene.log").exists()          # log cleaned
+
+
+def test_scene_ffmpeg_returns_stderr_on_clean_finish(tmp_path: Path):
+    wd = tmp_path / "scene"
+    wd.mkdir()
+    writer = (
+        "import sys\n"
+        f"d=r'{wd}'\n"
+        "for i in range(2):\n"
+        "    open(f'{d}/frame_%04d.jpg'%i,'wb').write(b'y'*10)\n"
+        "    sys.stderr.write('pts_time:%d.5\\n'%i)\n"
+    )
+    rc, err = frames._run_scene_ffmpeg([sys.executable, "-c", writer], wd, timeout=30, max_bytes=10 ** 7)
+    assert rc == 0
+    assert "pts_time:0.5" in err and "pts_time:1.5" in err   # showinfo captured for parsing
+    assert len(list(wd.glob("frame_*.jpg"))) == 2
+
+
+def test_scene_ffmpeg_times_out(tmp_path: Path):
+    wd = tmp_path / "scene"
+    wd.mkdir()
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        frames._run_scene_ffmpeg([sys.executable, "-c", "import time; time.sleep(30)"], wd, timeout=2, max_bytes=10 ** 9)
+    assert "timed out" in str(exc.value)
+
+
+def test_scene_ffmpeg_catches_fast_finishing_over_quota(tmp_path: Path):
+    # Codex round-4: a burst that crosses the cap and exits inside the first poll
+    # interval must still be caught by the post-exit check (same fast-finish race
+    # the download watchdog handles).
+    wd = tmp_path / "scene"
+    wd.mkdir()
+    writer = (
+        "import sys\n"
+        f"d=r'{wd}'\n"
+        "open(d+'/frame_0000.jpg','wb').write(b'x'*(8*1024*1024))\n"
+        "sys.stderr.write('pts_time:0.0\\n')\n"
+    )
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        frames._run_scene_ffmpeg([sys.executable, "-c", writer], wd, timeout=30, max_bytes=4 * 1024 * 1024)
+    assert "transient-frame cap" in str(exc.value)
+    assert list(wd.glob("frame_*.jpg")) == []
+
+
+def test_scene_ffmpeg_bounds_stderr_log(tmp_path: Path, monkeypatch):
+    # Codex round-5: the ffmpeg stderr log is watched too — a decoder-diagnostic
+    # flood can't grow it (and the completion-path read_text) without bound.
+    monkeypatch.setattr(frames, "SCENE_LOG_MAX", 1024 * 1024)
+    wd = tmp_path / "scene"
+    wd.mkdir()
+    spam = "import sys\nsys.stderr.write('x'*(3*1024*1024)); sys.stderr.flush()\n"
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        frames._run_scene_ffmpeg([sys.executable, "-c", spam], wd, timeout=30, max_bytes=10 ** 9)
+    assert "diagnostics" in str(exc.value)
+    assert not (wd / "_scene.log").exists()

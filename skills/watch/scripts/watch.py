@@ -58,21 +58,45 @@ def validate_range(start_sec: float | None, end_sec: float | None, full_duration
 
 
 def _cap_total_frames(frames: list[dict], ceiling: int) -> tuple[list[dict], int]:
-    """Even-sample a frame list down to ``ceiling`` (first + last kept), reindex.
+    """Even-sample a frame list down to ``ceiling``, favouring pinned cue frames,
+    deleting the JPEGs it drops, and reindexing.
 
-    Backstop for uncapped (token-burner) selection; JPEGs left on disk are
-    harmless in the work dir. Returns (kept, dropped_count)."""
+    Cue frames (``reason == "transcript-cue"``) are the moments the user
+    explicitly asked for, so the leftover budget goes to detail frames first. But
+    the ceiling is absolute: if the cues alone exceed it, even the cues are
+    thinned — a caller can't smuggle unbounded frames past the cap with a flood of
+    ``--timestamps``. ``ceiling`` is assumed >= 1. Returns (kept, dropped)."""
     if len(frames) <= ceiling:
         return frames, 0
-    idx = sorted({round(i * (len(frames) - 1) / (ceiling - 1)) for i in range(ceiling)})
-    kept = [frames[i] for i in idx]
+    ceiling = max(1, ceiling)
+    cues = [f for f in frames if f.get("reason") == "transcript-cue"]
+    others = [f for f in frames if f.get("reason") != "transcript-cue"]
+
+    if len(cues) >= ceiling:
+        keep_cues = [cues[i] for i in _even_indices(len(cues), ceiling)]
+        keep_others: list[dict] = []
+    else:
+        keep_cues = cues
+        budget = ceiling - len(cues)  # >= 1
+        keep_others = [others[i] for i in _even_indices(len(others), budget)]
+
+    keep_paths = {f["path"] for f in keep_cues} | {f["path"] for f in keep_others}
+    dropped = 0
+    for f in frames:
+        if f["path"] not in keep_paths:
+            dropped += 1
+            try:
+                Path(f["path"]).unlink()
+            except OSError:
+                pass
+    kept = sorted(keep_cues + keep_others, key=lambda f: f["timestamp_seconds"])
     for i, frame in enumerate(kept):
         frame["index"] = i
-    return kept, len(frames) - len(kept)
+    return kept, dropped
 
 from config import frame_cap, get_config  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import MAX_FPS, _even_indices, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -135,12 +159,21 @@ def main() -> int:
     budget_cap = max_frames if max_frames is not None else 100
     cue_timestamps = parse_timestamps(args.timestamps)
 
+    # Every run gets its own unique work directory, so a shared or reused --out-dir
+    # can't let concurrent runs clobber each other's frames, downloads, logs, or
+    # transcript. Extractors clear frame_*.jpg / cue_*.jpg on entry and the scene
+    # watchdog deletes them on failure, so an isolated run dir (not just an isolated
+    # download subdir) is what keeps two overlapping runs from mixing artifacts or
+    # producing a report for the wrong video. A caller-provided --out-dir is treated
+    # as a root under which the unique run dir is nested.
     if args.out_dir:
-        work = Path(args.out_dir).expanduser().resolve()
+        root = Path(args.out_dir).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="watch-", dir=root))
     else:
         work = Path(tempfile.mkdtemp(prefix="watch-"))
-    work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
+    download_dir = work / "download"
 
     url_source = is_url(args.source)
     dl: dict = {"subtitle_path": None, "info": {}, "downloaded": False}
@@ -151,7 +184,7 @@ def main() -> int:
 
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
-        dl = fetch_captions(args.source, work / "download")
+        dl = fetch_captions(args.source, download_dir)
         if dl.get("subtitle_path"):
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
@@ -183,12 +216,12 @@ def main() -> int:
             )
             dl = download(
                 args.source,
-                work / "download",
+                download_dir,
                 audio_only=audio_only,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)
-            dl = download(args.source, work / "download")
+            dl = download(args.source, download_dir)
         video_path = dl["video_path"]
 
     meta = get_metadata(video_path) if video_path else {
@@ -244,6 +277,11 @@ def main() -> int:
     cue_frames: list[dict] = []
     cue_meta: dict = {}
 
+    # Effective per-run ceiling: token-burner leaves max_frames unset (None), but
+    # extraction must still be bounded so a rapid-cut clip can't materialize
+    # thousands of JPEGs — cap it at HARD_FRAME_CEILING for reservation math.
+    frame_ceiling = max_frames if max_frames is not None else HARD_FRAME_CEILING
+
     # Transcript cues are pinned: extracted first and counted against the cap so
     # the detail engine never evicts the moments the user explicitly asked for.
     if cue_timestamps and video_path and has_video:
@@ -252,7 +290,7 @@ def main() -> int:
             work / "frames",
             cue_timestamps,
             resolution=args.resolution,
-            max_frames=max_frames,
+            max_frames=frame_ceiling,
             start_seconds=start_sec,
             end_seconds=end_sec,
         )
@@ -263,9 +301,9 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-    detail_budget = max_frames if max_frames is None else max(0, max_frames - len(cue_frames))
+    detail_budget = max(0, frame_ceiling - len(cue_frames))
     if detail != "transcript" and video_path and has_video and detail_budget != 0:
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
+        cap_label = str(detail_budget)
         engine_label = "keyframes" if detail == "efficient" else "scene-aware frames"
         print(
             f"[watch] extracting {engine_label} over {scope} "
@@ -298,14 +336,15 @@ def main() -> int:
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
 
-    # Backstop for uncapped (token-burner) selection: never hand the agent more
-    # than HARD_FRAME_CEILING frames to Read, no matter how many scene cuts exist.
+    # Final backstop: never hand the agent more than the effective ceiling
+    # (frame_ceiling honors an explicit --max-frames, else HARD_FRAME_CEILING).
+    # Cue frames are favoured but the ceiling is absolute; dropped JPEGs deleted.
     ceiling_dropped = 0
-    if max_frames is None and len(frames) > HARD_FRAME_CEILING:
-        frames, ceiling_dropped = _cap_total_frames(frames, HARD_FRAME_CEILING)
+    if len(frames) > frame_ceiling:
+        frames, ceiling_dropped = _cap_total_frames(frames, frame_ceiling)
         print(
-            f"[watch] token-burner selected {len(frames) + ceiling_dropped} frames — "
-            f"capped to {HARD_FRAME_CEILING} (evenly sampled). Pass --max-frames to change.",
+            f"[watch] selected {len(frames) + ceiling_dropped} frames — "
+            f"capped to {len(frames)} (evenly sampled, cues kept). Pass --max-frames to change.",
             file=sys.stderr,
         )
 
@@ -371,7 +410,7 @@ def main() -> int:
     if detail != "transcript" and video_path and not has_video:
         print("- **Frames:** skipped (source has no video stream)")
     elif detail != "transcript":
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
+        cap_label = str(detail_budget)
         engine = frame_meta.get("engine", "scene")
         fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
         deduped = frame_meta.get("deduped_count", 0)
@@ -383,10 +422,13 @@ def main() -> int:
     elif not cue_frames:
         print("- **Frames:** skipped (transcript detail)")
     if cue_frames:
+        # Count survivors in the final list — the ceiling backstop preserves cues,
+        # but report what actually shipped rather than the pre-cap count.
+        surviving_cues = sum(1 for f in frames if f.get("reason") == "transcript-cue")
         dropped = cue_meta.get("dropped_out_of_window", 0)
         drop_note = f", {dropped} dropped outside range" if dropped else ""
         print(
-            f"- **Cue frames:** {len(cue_frames)} at transcript-flagged timestamps "
+            f"- **Cue frames:** {surviving_cues} at transcript-flagged timestamps "
             f"(transcript-cue{drop_note})"
         )
     if frames:
@@ -403,8 +445,8 @@ def main() -> int:
     if ceiling_dropped:
         print()
         print(
-            f"> **Warning:** token-burner selected {len(frames) + ceiling_dropped} frames; "
-            f"capped to {len(frames)} (evenly sampled) to protect context. "
+            f"> **Warning:** {len(frames) + ceiling_dropped} frames were selected; "
+            f"capped to {len(frames)} (evenly sampled, cue frames kept) to protect context. "
             "Pass `--max-frames N` or `--start/--end` for finer control."
         )
     elif detail == "token-burner" and len(frames) > 250:
