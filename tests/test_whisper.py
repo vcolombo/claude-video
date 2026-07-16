@@ -220,6 +220,17 @@ class TestTranscribeVideoCostGuard:
         assert "cap" in str(exc.value)
         assert not audio.exists()  # oversized mp3 cleaned up, nothing uploaded
 
+    def test_aborts_when_chunk_plan_exceeds_cap(self, monkeypatch, tmp_path):
+        # Audio over the upload cap splits into chunks; if the split would need
+        # more than MAX_CHUNKS uploads, refuse rather than fan out unbounded cost.
+        monkeypatch.setattr(whisper, "MAX_UPLOAD_BYTES", 10)
+        monkeypatch.setattr(whisper, "MAX_CHUNKS", 2)
+        monkeypatch.setattr(whisper, "audio_duration", lambda _p: 100.0)
+        audio = self._stub(monkeypatch, 100, tmp_path)  # 100 B / 10 B cap → 10 chunks > 2
+        with pytest.raises(SystemExit) as exc:
+            whisper.transcribe_video("v.mp4", audio, backend="groq", api_key="k")
+        assert "chunk cap" in str(exc.value)
+
     def test_shifts_segments_to_absolute_time(self, monkeypatch, tmp_path):
         # Windowed extraction returns 0-based segments; the window offset must be
         # added back so filter_range and the report use source time.
