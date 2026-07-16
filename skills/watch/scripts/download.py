@@ -32,6 +32,10 @@ MAX_TOTAL_BYTES = 5 * 1024 ** 3  # 5 GiB
 # The caption/metadata pass is --skip-download, but subtitle/info responses are
 # still written to disk with no per-file cap, so it gets its own tighter ceiling.
 MAX_CAPTION_BYTES = 256 * 1024 * 1024  # 256 MiB
+# info.json sits under the caption disk cap but is otherwise read whole and
+# JSON-parsed; a hostile extractor response could balloon memory. Only the few
+# scalar fields below are used, so a small ceiling is plenty for any real video.
+MAX_INFO_BYTES = 4 * 1024 * 1024  # 4 MiB
 # yt-dlp reads config (yt-dlp.conf) from the CWD and other locations, and config
 # can carry --exec → arbitrary command execution. Run hermetically everywhere.
 IGNORE_CONFIG = ["--ignore-config"]
@@ -133,28 +137,50 @@ def _dir_size(path: Path) -> int:
 def _kill_process_group(proc: subprocess.Popen) -> None:
     """Terminate the whole process tree (yt-dlp spawns ffmpeg for merges).
 
-    Uses the POSIX process group when available; falls back to killing just the
-    process (best effort) on platforms without ``killpg`` (Windows)."""
-    def _signal(sig) -> bool:
+    POSIX: signal the process group (``start_new_session`` put yt-dlp + ffmpeg in
+    their own group). Windows has no ``killpg``, so use ``taskkill /T`` to kill the
+    whole tree — a bare ``terminate()`` would leave the ffmpeg child writing and
+    defeat the disk cap. Bare terminate/kill is only the last-resort fallback."""
+    def _killpg(sig) -> bool:
         try:
             os.killpg(proc.pid, sig)
             return True
         except (AttributeError, ProcessLookupError, PermissionError, OSError):
             return False
 
-    if not _signal(signal.SIGTERM):
+    def _taskkill_tree() -> bool:
         try:
-            proc.terminate()
-        except OSError:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    if _killpg(signal.SIGTERM):
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _killpg(signal.SIGKILL)
+        return
+    if _taskkill_tree():  # Windows: reap the whole tree, ffmpeg child included
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             pass
+        return
+    try:
+        proc.terminate()
+    except OSError:
+        pass
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        if not _signal(signal.SIGKILL):
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _run_ytdlp_watched(
@@ -173,13 +199,26 @@ def _run_ytdlp_watched(
     """
     mb_cap = max_bytes // (1024 * 1024)
 
+    def _purge() -> None:
+        # Fail loud: if the tree kill didn't fully release the files (e.g. a
+        # surviving child on a locked-file platform), the partial output stays on
+        # disk and would silently defeat the cap. Warn so it isn't invisible.
+        shutil.rmtree(watch_dir, ignore_errors=True)
+        if watch_dir.exists():
+            print(
+                f"[watch] warning: could not fully remove {watch_dir} after abort — "
+                "a killed subprocess may still hold files open.",
+                file=sys.stderr,
+            )
+
     def _over_quota() -> None:
         _kill_process_group(proc)
-        shutil.rmtree(watch_dir, ignore_errors=True)
+        _purge()
         raise SystemExit(
             f"{kind} exceeded the {mb_cap} MiB aggregate disk cap and was aborted "
-            "(fragmented, oversized, or hostile source). "
-            "Use --start/--end to grab a section instead."
+            "(fragmented, oversized, or hostile source). Try a shorter video or a "
+            "direct clip URL — a range only limits post-download frame extraction, "
+            "not the download itself."
         )
 
     proc = subprocess.Popen(
@@ -195,11 +234,10 @@ def _run_ytdlp_watched(
                 pass
             if time.monotonic() - start > timeout:
                 _kill_process_group(proc)
-                shutil.rmtree(watch_dir, ignore_errors=True)
+                _purge()
                 raise SystemExit(
                     f"yt-dlp timed out after {timeout}s — the source may be a live "
-                    "stream or an unreachable host. Try a specific clip URL, or "
-                    "--start/--end on a finite video."
+                    "stream or an unreachable host. Try a specific, shorter clip URL."
                 )
             if _dir_size(watch_dir) > max_bytes:
                 _over_quota()
@@ -287,6 +325,13 @@ def _read_info(info_path: Path, url: str) -> dict:
     info: dict = {}
     if info_path.exists():
         try:
+            if info_path.stat().st_size > MAX_INFO_BYTES:
+                print(
+                    f"[watch] info.json exceeds {MAX_INFO_BYTES // (1024 * 1024)} MiB — "
+                    "ignoring metadata (keeping only the URL).",
+                    file=sys.stderr,
+                )
+                return {"url": url}
             raw = json.loads(info_path.read_text(encoding="utf-8"))
             info = {
                 "title": raw.get("title"),

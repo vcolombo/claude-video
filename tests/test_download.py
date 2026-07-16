@@ -211,3 +211,19 @@ def test_watched_run_catches_fast_finishing_over_quota(tmp_path):
     with pytest.raises(SystemExit):
         download._run_ytdlp_watched(cmd, timeout=30, watch_dir=wd, max_bytes=4 * 1024 * 1024)
     assert not wd.exists() or download._dir_size(wd) == 0
+
+
+# --- metadata / info.json memory bound (Codex round-5) -----------------------
+
+def test_read_info_ignores_oversized_json(tmp_path):
+    p = tmp_path / "video.info.json"
+    p.write_text('{"title":"t","pad":"' + "a" * (5 * 1024 * 1024) + '"}', encoding="utf-8")
+    # Over MAX_INFO_BYTES: parsed metadata is discarded, only the URL is kept, so a
+    # hostile extractor response can't balloon memory via json.loads.
+    assert download._read_info(p, "https://host/v") == {"url": "https://host/v"}
+
+
+def test_read_info_parses_small_json(tmp_path):
+    p = tmp_path / "video.info.json"
+    p.write_text('{"title":"Real","webpage_url":"https://host/v"}', encoding="utf-8")
+    assert download._read_info(p, "https://host/v")["title"] == "Real"

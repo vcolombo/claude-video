@@ -180,3 +180,17 @@ def test_scene_ffmpeg_catches_fast_finishing_over_quota(tmp_path: Path):
         frames._run_scene_ffmpeg([sys.executable, "-c", writer], wd, timeout=30, max_bytes=4 * 1024 * 1024)
     assert "transient-frame cap" in str(exc.value)
     assert list(wd.glob("frame_*.jpg")) == []
+
+
+def test_scene_ffmpeg_bounds_stderr_log(tmp_path: Path, monkeypatch):
+    # Codex round-5: the ffmpeg stderr log is watched too — a decoder-diagnostic
+    # flood can't grow it (and the completion-path read_text) without bound.
+    monkeypatch.setattr(frames, "SCENE_LOG_MAX", 1024 * 1024)
+    wd = tmp_path / "scene"
+    wd.mkdir()
+    spam = "import sys\nsys.stderr.write('x'*(3*1024*1024)); sys.stderr.flush()\n"
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        frames._run_scene_ffmpeg([sys.executable, "-c", spam], wd, timeout=30, max_bytes=10 ** 9)
+    assert "diagnostics" in str(exc.value)
+    assert not (wd / "_scene.log").exists()

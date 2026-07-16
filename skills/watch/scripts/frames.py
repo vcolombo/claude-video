@@ -49,6 +49,11 @@ FFMPEG_TIMEOUT = 900
 # watchdog. 1 GiB of ~512px q4 frames is tens of thousands of shots: legit videos
 # never approach it, only strobing/adversarial ones do.
 SCENE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
+# ffmpeg stderr (showinfo pts_time + any decoder diagnostics) is captured to a log
+# the watchdog also bounds: legit showinfo is tiny (~200 B/frame), but a corrupt or
+# hostile file can spam warnings unboundedly, growing the log outside the frame cap
+# and then being read whole into memory. Keeping it small bounds disk AND the read.
+SCENE_LOG_MAX = 64 * 1024 * 1024  # 64 MiB
 
 
 def _require(binary: str) -> None:
@@ -122,6 +127,28 @@ def _run_scene_ffmpeg(
         except OSError:
             pass
 
+    def _log_bytes() -> int:
+        try:
+            return log.stat().st_size
+        except OSError:
+            return 0
+
+    def _over_cap() -> str | None:
+        """Return an abort reason if the frames or the stderr log breach their cap."""
+        if _frames_bytes(out_dir) > max_bytes:
+            return (
+                f"scene detection exceeded the {max_bytes // (1024 * 1024)} MiB "
+                "transient-frame cap (cut-heavy, oversized, or hostile input). "
+                "Use --start/--end to grab a section, or a lower --detail."
+            )
+        if _log_bytes() > SCENE_LOG_MAX:
+            return (
+                f"scene detection produced over {SCENE_LOG_MAX // (1024 * 1024)} MiB "
+                "of ffmpeg diagnostics (corrupt or hostile input). Use --start/--end, "
+                "or a lower --detail."
+            )
+        return None
+
     with open(log, "wb") as errf:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf)
         start = time.monotonic()
@@ -139,26 +166,20 @@ def _run_scene_ffmpeg(
                         f"ffmpeg scene detection timed out after {timeout}s "
                         "(possibly a corrupt or stalled input)."
                     )
-                if _frames_bytes(out_dir) > max_bytes:
+                reason = _over_cap()
+                if reason:
                     _kill(proc)
                     _cleanup()
-                    raise SystemExit(
-                        f"scene detection exceeded the {max_bytes // (1024 * 1024)} MiB "
-                        "transient-frame cap (cut-heavy, oversized, or hostile input). "
-                        "Use --start/--end to grab a section, or a lower --detail."
-                    )
+                    raise SystemExit(reason)
         finally:
             if proc.poll() is None:
                 _kill(proc)
-    # Final check: a burst that crossed the cap and exited within the last poll
+    # Final check: a burst that crossed a cap and exited within the last poll
     # interval would otherwise be accepted on the completion path.
-    if _frames_bytes(out_dir) > max_bytes:
+    reason = _over_cap()
+    if reason:
         _cleanup()
-        raise SystemExit(
-            f"scene detection exceeded the {max_bytes // (1024 * 1024)} MiB "
-            "transient-frame cap (cut-heavy, oversized, or hostile input). "
-            "Use --start/--end to grab a section, or a lower --detail."
-        )
+        raise SystemExit(reason)
     stderr_text = log.read_text(encoding="utf-8", errors="replace")
     try:
         log.unlink()
