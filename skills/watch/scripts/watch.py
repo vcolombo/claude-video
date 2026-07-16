@@ -159,17 +159,21 @@ def main() -> int:
     budget_cap = max_frames if max_frames is not None else 100
     cue_timestamps = parse_timestamps(args.timestamps)
 
+    # Every run gets its own unique work directory, so a shared or reused --out-dir
+    # can't let concurrent runs clobber each other's frames, downloads, logs, or
+    # transcript. Extractors clear frame_*.jpg / cue_*.jpg on entry and the scene
+    # watchdog deletes them on failure, so an isolated run dir (not just an isolated
+    # download subdir) is what keeps two overlapping runs from mixing artifacts or
+    # producing a report for the wrong video. A caller-provided --out-dir is treated
+    # as a root under which the unique run dir is nested.
     if args.out_dir:
-        work = Path(args.out_dir).expanduser().resolve()
+        root = Path(args.out_dir).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="watch-", dir=root))
     else:
         work = Path(tempfile.mkdtemp(prefix="watch-"))
-    work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
-    # Unique per-run download subdir. The download watchdog rmtrees this dir on a
-    # timeout/quota breach, so a shared or reused --out-dir must not let one run's
-    # cleanup erase a concurrent run's files. mkdtemp is unique even when work is
-    # a caller-supplied, reused directory.
-    download_dir = Path(tempfile.mkdtemp(prefix="dl-", dir=work))
+    download_dir = work / "download"
 
     url_source = is_url(args.source)
     dl: dict = {"subtitle_path": None, "info": {}, "downloaded": False}

@@ -150,6 +150,15 @@ def _run_scene_ffmpeg(
         finally:
             if proc.poll() is None:
                 _kill(proc)
+    # Final check: a burst that crossed the cap and exited within the last poll
+    # interval would otherwise be accepted on the completion path.
+    if _frames_bytes(out_dir) > max_bytes:
+        _cleanup()
+        raise SystemExit(
+            f"scene detection exceeded the {max_bytes // (1024 * 1024)} MiB "
+            "transient-frame cap (cut-heavy, oversized, or hostile input). "
+            "Use --start/--end to grab a section, or a lower --detail."
+        )
     stderr_text = log.read_text(encoding="utf-8", errors="replace")
     try:
         log.unlink()

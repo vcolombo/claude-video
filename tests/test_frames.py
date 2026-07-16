@@ -161,3 +161,22 @@ def test_scene_ffmpeg_times_out(tmp_path: Path):
     with pytest.raises(SystemExit) as exc:
         frames._run_scene_ffmpeg([sys.executable, "-c", "import time; time.sleep(30)"], wd, timeout=2, max_bytes=10 ** 9)
     assert "timed out" in str(exc.value)
+
+
+def test_scene_ffmpeg_catches_fast_finishing_over_quota(tmp_path: Path):
+    # Codex round-4: a burst that crosses the cap and exits inside the first poll
+    # interval must still be caught by the post-exit check (same fast-finish race
+    # the download watchdog handles).
+    wd = tmp_path / "scene"
+    wd.mkdir()
+    writer = (
+        "import sys\n"
+        f"d=r'{wd}'\n"
+        "open(d+'/frame_0000.jpg','wb').write(b'x'*(8*1024*1024))\n"
+        "sys.stderr.write('pts_time:0.0\\n')\n"
+    )
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        frames._run_scene_ffmpeg([sys.executable, "-c", writer], wd, timeout=30, max_bytes=4 * 1024 * 1024)
+    assert "transient-frame cap" in str(exc.value)
+    assert list(wd.glob("frame_*.jpg")) == []
