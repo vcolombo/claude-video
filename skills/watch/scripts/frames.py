@@ -8,6 +8,7 @@ zooming in for detail).
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -54,6 +55,29 @@ SCENE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
 # hostile file can spam warnings unboundedly, growing the log outside the frame cap
 # and then being read whole into memory. Keeping it small bounds disk AND the read.
 SCENE_LOG_MAX = 64 * 1024 * 1024  # 64 MiB
+
+
+@functools.lru_cache(maxsize=1)
+def _fps_sync_args() -> list[str]:
+    """Return the VFR frame-sync flag for this ffmpeg build.
+
+    ffmpeg 5.1 renamed `-vsync vfr` to `-fps_mode vfr`; ffmpeg 8+ removed
+    `-vsync` entirely. Probe the version once and emit the supported spelling.
+    Only a *confirmed* pre-5.1 version gets the old spelling: unparseable
+    output (e.g. nightly `N-...` builds, which are modern) falls through to
+    `-fps_mode`, as does a failed probe.
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=10
+        )
+        first_line = (result.stdout or "").splitlines()[0] if result.stdout else ""
+        match = re.search(r"ffmpeg version (?:n)?(\d+)\.(\d+)", first_line)
+        if match and (int(match.group(1)), int(match.group(2))) < (5, 1):
+            return ["-vsync", "vfr"]
+    except Exception:
+        pass
+    return ["-fps_mode", "vfr"]
 
 
 def _require(binary: str) -> None:
@@ -411,7 +435,7 @@ def extract_scene_candidates(
     cmd += [
         "-i", str(Path(video_path).resolve()),
         "-vf", vf,
-        "-vsync", "vfr",
+        *_fps_sync_args(),
     ]
     if max_frames is not None:
         cmd += ["-frames:v", str(max_frames)]
@@ -769,7 +793,7 @@ def extract_keyframes(
         "-skip_frame", "nokey",
         "-i", str(Path(video_path).resolve()),
         "-vf", f"{_scale_filter(resolution)},showinfo",
-        "-vsync", "vfr",
+        *_fps_sync_args(),
         "-q:v", "4",
         output_pattern,
     ]

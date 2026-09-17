@@ -28,6 +28,7 @@ Agent Skills package that gives an agent a video input. Installable across Claud
 |---------|---------|
 | Claude Code | `/plugin marketplace add bradautomates/claude-video` then `/plugin install watch@claude-video` |
 | Codex / Cursor / Copilot / +50 | `npx skills add bradautomates/claude-video -g` |
+| omp | `omp plugin marketplace add <path-to-clone>` then `omp plugin install watch@claude-video` |
 | claude.ai (web) | upload `dist/watch.skill` (built by `skills/watch/scripts/build-skill.sh`) |
 
 ## Commands
@@ -45,6 +46,20 @@ bash skills/watch/scripts/build-skill.sh   # → dist/watch.skill
 
 ## Rules
 
-- Keep the version in sync across `skills/watch/SKILL.md` (frontmatter), `.claude-plugin/plugin.json`, and `.codex-plugin/plugin.json` when cutting a release.
+- Keep the version in sync across `skills/watch/SKILL.md` (frontmatter), `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, and `package.json` when cutting a release.
 - Releasing: tag `vX.Y.Z` and push the tag; `.github/workflows/release.yml` builds `dist/watch.skill` and attaches it to the GitHub release.
 - Never commit real API keys or `.env` contents; keys live in `~/.config/watch/.env` (mode `0600`) at runtime.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-label vocabulary. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout. See `docs/agents/domain.md`.

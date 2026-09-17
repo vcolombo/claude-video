@@ -194,3 +194,24 @@ def test_scene_ffmpeg_bounds_stderr_log(tmp_path: Path, monkeypatch):
         frames._run_ffmpeg_watched([sys.executable, "-c", spam], wd, timeout=30, max_bytes=10 ** 9)
     assert "diagnostics" in str(exc.value)
     assert not (wd / "_scene.log").exists()
+
+def test_fps_sync_flag_follows_ffmpeg_version(monkeypatch):
+    # ffmpeg 8+ removed `-vsync`; only a confirmed pre-5.1 build gets the old
+    # spelling. Unparseable output (nightly `N-...` builds are modern) and a
+    # failed probe must fall through to `-fps_mode`.
+    from types import SimpleNamespace
+
+    def _versioned(first_line):
+        def fake_run(*args, **kwargs):
+            return SimpleNamespace(stdout=first_line + "\nbuilt with gcc\n")
+        monkeypatch.setattr(frames.subprocess, "run", fake_run)
+        frames._fps_sync_args.cache_clear()
+        return frames._fps_sync_args()
+
+    try:
+        assert _versioned("ffmpeg version 4.4.2 Copyright") == ["-vsync", "vfr"]
+        assert _versioned("ffmpeg version 9.0.1 Copyright") == ["-fps_mode", "vfr"]
+        assert _versioned("ffmpeg version N-118124-gabc123") == ["-fps_mode", "vfr"]
+    finally:
+        # Don't leak the stubbed probe into extraction tests on old-ffmpeg hosts.
+        frames._fps_sync_args.cache_clear()
