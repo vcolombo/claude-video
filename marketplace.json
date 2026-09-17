@@ -1,0 +1,27 @@
+{
+  "name": "claude-video",
+  "owner": {
+    "name": "vcolombo",
+    "url": "https://github.com/vcolombo/claude-video"
+  },
+  "description": "Watch skill marketplace: give the agent a video input.",
+  "plugins": [
+    {
+      "name": "watch",
+      "source": "./",
+      "description": "Give the agent a video input. Downloads a URL or local file, extracts frames with ffmpeg, and pulls a timestamped transcript, so the agent can answer questions about what's in the video.",
+      "category": "media",
+      "keywords": [
+        "video",
+        "watch",
+        "youtube",
+        "transcription",
+        "whisper",
+        "yt-dlp",
+        "ffmpeg",
+        "multimodal",
+        "frames"
+      ]
+    }
+  ]
+}
