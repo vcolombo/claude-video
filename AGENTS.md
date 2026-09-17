@@ -28,7 +28,7 @@ Agent Skills package that gives an agent a video input. Installable across Claud
 |---------|---------|
 | Claude Code | `/plugin marketplace add bradautomates/claude-video` then `/plugin install watch@claude-video` |
 | Codex / Cursor / Copilot / +50 | `npx skills add bradautomates/claude-video -g` |
-| omp | `omp plugin marketplace add <path-to-clone>` then `omp plugin install watch@claude-video` |
+| omp | `omp plugin marketplace add vcolombo/claude-video` then `omp plugin install watch@claude-video` |
 | claude.ai (web) | upload `dist/watch.skill` (built by `skills/watch/scripts/build-skill.sh`) |
 
 ## Commands
